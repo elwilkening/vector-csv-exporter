@@ -132,7 +132,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                     )
                     continue
 
-                transform = QgsCoordinateTransform(layer.crs(), QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance())
+                transform = self._build_transform(layer.crs(), self._get_wgs84_crs())
                 field_lookup = {name.lower(): idx for idx, name in enumerate(field_names)}
 
                 if layer.featureCount() == 0:
@@ -168,6 +168,25 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         if isinstance(value, str):
             return value.encode("utf-8", errors="replace").decode("utf-8")
         return str(value)
+
+    def _get_wgs84_crs(self):
+        try:
+            return QgsCoordinateReferenceSystem("EPSG:4326")
+        except TypeError:
+            return QgsCoordinateReferenceSystem.fromEpsgId(4326)
+
+    def _build_transform(self, source_crs, destination_crs):
+        project = QgsProject.instance()
+        if hasattr(project, "transformContext"):
+            try:
+                return QgsCoordinateTransform(source_crs, destination_crs, project.transformContext())
+            except TypeError:
+                pass
+
+        try:
+            return QgsCoordinateTransform(source_crs, destination_crs, project)
+        except TypeError:
+            return QgsCoordinateTransform(source_crs, destination_crs)
 
     def _sanitize_prefix(self, prefix):
         import re
