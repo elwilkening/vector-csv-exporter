@@ -1,10 +1,10 @@
 [general]
 name=Vector CSV Exporter
-qgisMinimumVersion=3.44
+qgisMinimumVersion=3.4
 description=Exports selected vector layer attributes and geometries to CSV files
 version=1.0.0
-author=OpenAI
-email=dev@example.com
+author=Eric Wilkening with OpenAI
+email=elwilkening@outlook.com
 about=This plugin exports selected vector layers to one or more CSV files, reprojecting geometries to WGS84 and grouping layers by matching field names.
 tracker=https://example.com/issues
 repository=https://example.com/repository
