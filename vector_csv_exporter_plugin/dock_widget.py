@@ -102,7 +102,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 continue
             if layer.featureCount() == 0:
                 self._log_message(f"Layer '{layer.name()}' has zero features; exporting header only.", "warning")
-            group_key = self._header_signature(field_names)
+            group_key = self._data_header_signature(field_names)
             grouped_layers.setdefault(group_key, []).append((layer, field_names))
 
         if not grouped_layers:
@@ -111,7 +111,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
         group_count = len(grouped_layers)
         for index, (_, layers_with_fields) in enumerate(grouped_layers.items(), start=1):
-            header = layers_with_fields[0][1] + [self._source_layer_column_name(layers_with_fields[0][1]), "GEOMETRY"]
+            header = self._build_group_header(layers_with_fields)
             output_name = self._build_output_name(prefix, group_count, index)
             output_path = os.path.join(output_dir, output_name)
             try:
@@ -177,8 +177,24 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             return "SOURCE_LAYER_2"
         return suggestion
 
-    def _header_signature(self, field_names):
-        return tuple(sorted(name.strip().lower() for name in field_names))
+    def _data_header_signature(self, field_names):
+        return tuple(sorted(name.strip().lower() for name in field_names if name.strip().lower() != "geometry"))
+
+    def _build_group_header(self, layers_with_fields):
+        header = []
+        seen = set()
+        for _, field_names in layers_with_fields:
+            for name in field_names:
+                normalized = name.strip().lower()
+                if normalized == "geometry":
+                    continue
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                header.append(name)
+        header.append(self._source_layer_column_name(header))
+        header.append("GEOMETRY")
+        return header
 
     def _get_wgs84_crs(self):
         try:
