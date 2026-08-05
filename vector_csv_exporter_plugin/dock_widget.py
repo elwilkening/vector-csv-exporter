@@ -93,15 +93,16 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         grouped_layers = {}
 
         for layer in selected_layers:
-            field_names = [field.name() for field in layer.fields()]
+            field_names = [field.name().strip() for field in layer.fields()]
             if not field_names:
                 self._log_message(f"Layer '{layer.name()}' has zero attribute fields; exporting geometry-only CSV.", "info")
-            if len({name.lower() for name in field_names}) != len(field_names):
+            normalized_names = [name.lower() for name in field_names]
+            if len(set(normalized_names)) != len(field_names):
                 self._log_message(f"Skipping layer '{layer.name()}': duplicate field names detected.", "warning")
                 continue
             if layer.featureCount() == 0:
                 self._log_message(f"Layer '{layer.name()}' has zero features; exporting header only.", "warning")
-            group_key = tuple(sorted(name.lower() for name in field_names))
+            group_key = self._header_signature(field_names)
             grouped_layers.setdefault(group_key, []).append((layer, field_names))
 
         if not grouped_layers:
@@ -175,6 +176,9 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         if suggestion.lower() in {name.lower() for name in field_names}:
             return "SOURCE_LAYER_2"
         return suggestion
+
+    def _header_signature(self, field_names):
+        return tuple(sorted(name.strip().lower() for name in field_names))
 
     def _get_wgs84_crs(self):
         try:
