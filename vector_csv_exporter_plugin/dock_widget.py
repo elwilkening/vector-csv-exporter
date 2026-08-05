@@ -22,6 +22,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.setWindowTitle("Vector CSV Exporter")
         self.select_all_checkbox.stateChanged.connect(self._set_all_checked)
         self.export_button.clicked.connect(self.export_selected_layers)
+        self.refresh_button.clicked.connect(self.populate_layers)
         self.populate_layers()
 
     def populate_layers(self):
@@ -94,8 +95,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         for layer in selected_layers:
             field_names = [field.name() for field in layer.fields()]
             if not field_names:
-                self._log_message(f"Skipping layer '{layer.name()}': zero fields.", "warning")
-                continue
+                self._log_message(f"Layer '{layer.name()}' has zero attribute fields; exporting geometry-only CSV.", "info")
             if len({name.lower() for name in field_names}) != len(field_names):
                 self._log_message(f"Skipping layer '{layer.name()}': duplicate field names detected.", "warning")
                 continue
