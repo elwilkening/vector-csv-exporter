@@ -101,7 +101,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 continue
             if layer.featureCount() == 0:
                 self._log_message(f"Layer '{layer.name()}' has zero features; exporting header only.", "warning")
-            group_key = tuple(name.lower() for name in field_names)
+            group_key = tuple(sorted(name.lower() for name in field_names))
             grouped_layers.setdefault(group_key, []).append((layer, field_names))
 
         if not grouped_layers:
@@ -110,7 +110,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
         group_count = len(grouped_layers)
         for index, (_, layers_with_fields) in enumerate(grouped_layers.items(), start=1):
-            header = layers_with_fields[0][1] + ["GEOMETRY"]
+            header = layers_with_fields[0][1] + [self._source_layer_column_name(layers_with_fields[0][1]), "GEOMETRY"]
             output_name = self._build_output_name(prefix, group_count, index)
             output_path = os.path.join(output_dir, output_name)
             try:
@@ -150,13 +150,14 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                         continue
 
                     row = []
-                    for header_name in header[:-1]:
+                    for header_name in header[:-2]:
                         index = field_lookup.get(header_name.lower())
                         if index is None:
                             row.append("")
                         else:
                             value = feature.attributes()[index] if index < len(feature.attributes()) else None
                             row.append(self._normalize_value(value))
+                    row.append(layer.name())
                     row.append(geometry.asWkt())
                     writer.writerow(row)
 
@@ -168,6 +169,12 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         if isinstance(value, str):
             return value.encode("utf-8", errors="replace").decode("utf-8")
         return str(value)
+
+    def _source_layer_column_name(self, field_names):
+        suggestion = "SOURCE_LAYER"
+        if suggestion.lower() in {name.lower() for name in field_names}:
+            return "SOURCE_LAYER_2"
+        return suggestion
 
     def _get_wgs84_crs(self):
         try:
