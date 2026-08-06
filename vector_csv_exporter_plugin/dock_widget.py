@@ -4,14 +4,121 @@ import os
 from qgis.PyQt import QtCore, QtWidgets, uic
 from qgis.core import (
     Qgis,
+    QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsGeometry,
     QgsMapLayer,
     QgsMessageLog,
     QgsProject,
+    QgsTask,
     QgsVectorLayer,
 )
+from qgis.gui import QgsProjectionSelectionWidget
+
+from .export_utils import (
+    build_output_name,
+    data_header_signature,
+    normalize_value,
+    sanitize_prefix,
+    source_layer_column_name,
+)
+
+
+class ExportTask(QgsTask):
+    def __init__(self, description, group_specs, target_crs, delimiter, encoding, dock_widget):
+        super().__init__(description, QgsTask.CanCancel)
+        self.group_specs = group_specs
+        self.target_crs = target_crs
+        self.delimiter = delimiter
+        self.encoding = encoding
+        self.dock_widget = dock_widget
+        self.messages = []
+        self.error = None
+        self.total_features = sum(
+            sum(layer.featureCount() for layer, _, _ in spec["layers_with_fields"]) for spec in group_specs
+        )
+        self.features_written = 0
+
+    def run(self):
+        for spec in self.group_specs:
+            if self.isCanceled():
+                self.messages.append("Export cancelled by the user.")
+                return False
+            try:
+                self._write_group(spec)
+            except RuntimeError as exc:
+                if str(exc) == "cancelled":
+                    self.messages.append("Export cancelled by the user.")
+                    return False
+                self.error = str(exc)
+                self.messages.append(f"Export failed: {exc}")
+                return False
+            except OSError as exc:
+                self.error = str(exc)
+                self.messages.append(f"Failed to write file '{spec['output_path']}': {exc}")
+                return False
+
+        self.messages.append("Export completed successfully.")
+        return True
+
+    def _write_group(self, spec):
+        output_path = spec["output_path"]
+        header = spec["header"]
+        layers_with_fields = spec["layers_with_fields"]
+
+        with open(output_path, "w", encoding=self.encoding, errors="replace", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n", delimiter=self.delimiter)
+            writer.writerow(header)
+
+            for layer, field_names, transform in layers_with_fields:
+                if self.isCanceled():
+                    raise RuntimeError("cancelled")
+
+                if not layer.crs().isValid():
+                    self.messages.append(
+                        f"Skipping layer '{layer.name()}': invalid or undefined source CRS.",
+                    )
+                    continue
+
+                field_lookup = {name.lower(): idx for idx, name in enumerate(field_names)}
+
+                if layer.featureCount() == 0:
+                    continue
+
+                for feature in layer.getFeatures():
+                    if self.isCanceled():
+                        raise RuntimeError("cancelled")
+
+                    geometry = QgsGeometry(feature.geometry())
+                    if transform is not None:
+                        try:
+                            geometry.transform(transform)
+                        except Exception as exc:
+                            self.messages.append(
+                                f"Reprojection failed for '{layer.name()}': {exc}",
+                            )
+                            continue
+
+                    row = []
+                    for header_name in header[:-2]:
+                        index = field_lookup.get(header_name.lower())
+                        if index is None:
+                            row.append("")
+                        else:
+                            value = feature.attributes()[index] if index < len(feature.attributes()) else None
+                            row.append(self.dock_widget._normalize_value(value))
+                    row.append(layer.name())
+                    row.append(geometry.asWkt())
+                    writer.writerow(row)
+                    self.features_written += 1
+                    if self.total_features:
+                        progress = int(100 * self.features_written / self.total_features)
+                    else:
+                        progress = 100
+                    self.setProgress(progress)
+
+        self.messages.append(f"Exported {output_path}")
 
 
 class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
@@ -23,10 +130,30 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.select_all_checkbox.stateChanged.connect(self._set_all_checked)
         self.export_button.clicked.connect(self.export_selected_layers)
         self.refresh_button.clicked.connect(self.populate_layers)
+        self.cancel_button.clicked.connect(self._cancel_export)
+        self.layer_list_widget.itemClicked.connect(self._show_selected_layer_fields)
+        self.layer_list_widget.itemChanged.connect(self._on_layer_item_changed)
+        self.field_list_widget.itemChanged.connect(self._on_field_item_changed)
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self._active_task = None
+        self._cancel_requested = False
+        self._settings = QtCore.QSettings("QGIS", "VectorCsvExporter")
+        self._layer_field_selection = {}
+        self._active_layer_id = None
+        self._crs_selector = QgsProjectionSelectionWidget(self)
+        self._crs_selector.setCrs(self._get_wgs84_crs())
+        self.verticalLayout.addWidget(self._crs_selector)
+        self.keep_original_crs_checkbox = QtWidgets.QCheckBox("Keep original CRS")
+        self.verticalLayout.addWidget(self.keep_original_crs_checkbox)
+        self.keep_original_crs_checkbox.toggled.connect(self._update_crs_selector_state)
+        self._update_crs_selector_state(False)
         self.populate_layers()
 
     def populate_layers(self):
         self.layer_list_widget.clear()
+        self.field_list_widget.clear()
+        self._layer_field_selection = {}
         project = QgsProject.instance()
         warning_messages = []
 
@@ -37,6 +164,8 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
                 item.setCheckState(QtCore.Qt.Checked)
                 self.layer_list_widget.addItem(item)
+                field_names = [field.name().strip() for field in layer.fields()]
+                self._layer_field_selection[layer.id()] = set(field_names)
             else:
                 warning_messages.append(f"Skipped non-vector layer: {layer.name()}")
 
@@ -52,7 +181,61 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             item = self.layer_list_widget.item(index)
             item.setCheckState(checked_state)
 
+    def _on_layer_item_changed(self, item):
+        if item is None:
+            return
+        layer_id = item.data(QtCore.Qt.UserRole)
+        if not layer_id:
+            return
+        self._show_selected_layer_fields(item)
+
+    def _on_field_item_changed(self, item):
+        if item is None:
+            return
+        self._save_selected_fields(self._active_layer_id)
+
+    def _show_selected_layer_fields(self, item):
+        self.field_list_widget.clear()
+        if item is None:
+            return
+        layer_id = item.data(QtCore.Qt.UserRole)
+        if not layer_id:
+            return
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            return
+        self._active_layer_id = layer.id()
+        field_names = [field.name().strip() for field in layer.fields()]
+        checked_fields = self._layer_field_selection.get(layer.id(), set(field_names))
+        for field_name in field_names:
+            field_item = QtWidgets.QListWidgetItem(field_name)
+            field_item.setData(QtCore.Qt.UserRole, field_name)
+            field_item.setFlags(field_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            field_item.setCheckState(QtCore.Qt.Checked if field_name in checked_fields else QtCore.Qt.Unchecked)
+            self.field_list_widget.addItem(field_item)
+        self.field_list_widget.setVisible(True)
+
+    def _save_selected_fields(self, layer_id):
+        if not layer_id:
+            return
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if not isinstance(layer, QgsVectorLayer):
+            return
+        selected_fields = set()
+        for index in range(self.field_list_widget.count()):
+            item = self.field_list_widget.item(index)
+            if item.checkState() == QtCore.Qt.Checked:
+                selected_fields.add(item.text())
+        self._layer_field_selection[layer.id()] = selected_fields
+
+    def _update_crs_selector_state(self, checked):
+        self._crs_selector.setEnabled(not checked)
+
     def export_selected_layers(self):
+        if self._active_task is not None:
+            self._show_message("An export is already in progress.", "warning")
+            return
+
         selected_layers = []
         for index in range(self.layer_list_widget.count()):
             item = self.layer_list_widget.item(index)
@@ -66,36 +249,51 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             self._show_message("No layers selected for export.", "warning")
             return
 
+        default_dir = self._settings.value("output_dir", os.path.expanduser("~"), str)
         output_dir = QtWidgets.QFileDialog.getExistingDirectory(
             self,
             "Choose output directory",
-            os.path.expanduser("~"),
+            default_dir,
         )
         if not output_dir:
             self._log_message("Export cancelled by the user.", "info")
             return
 
+        self._settings.setValue("output_dir", output_dir)
+
         if not os.access(output_dir, os.W_OK):
             self._show_message(f"Cannot write to the selected directory: {output_dir}", "error")
             return
 
+        stored_prefix = self._settings.value("prefix", "export", str)
         prefix, ok = QtWidgets.QInputDialog.getText(
             self,
             "Export prefix",
             "Enter a shared prefix for the output files:",
-            text="export",
+            text=stored_prefix,
         )
         if not ok:
             self._log_message("Export cancelled by the user.", "info")
             return
 
+        self._settings.setValue("prefix", prefix)
         prefix = self._sanitize_prefix(prefix)
         grouped_layers = {}
 
         for layer in selected_layers:
-            field_names = [field.name().strip() for field in layer.fields()]
-            if not field_names:
-                self._log_message(f"Layer '{layer.name()}' has zero attribute fields; exporting geometry-only CSV.", "info")
+            all_field_names = [field.name().strip() for field in layer.fields()]
+            selected_fields = self._layer_field_selection.get(layer.id(), set(all_field_names))
+            field_names = [name for name in all_field_names if name in selected_fields]
+            if not field_names and all_field_names:
+                self._log_message(
+                    f"Layer '{layer.name()}' has no selected fields; exporting geometry-only CSV.",
+                    "info",
+                )
+            if not all_field_names:
+                self._log_message(
+                    f"Layer '{layer.name()}' has zero attribute fields; exporting geometry-only CSV.",
+                    "info",
+                )
             normalized_names = [name.lower() for name in field_names]
             if len(set(normalized_names)) != len(field_names):
                 self._log_message(f"Skipping layer '{layer.name()}': duplicate field names detected.", "warning")
@@ -110,19 +308,77 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             return
 
         group_count = len(grouped_layers)
+        group_specs = []
         for index, (_, layers_with_fields) in enumerate(grouped_layers.items(), start=1):
             header = self._build_group_header(layers_with_fields)
             output_name = self._build_output_name(prefix, group_count, index)
             output_path = os.path.join(output_dir, output_name)
-            try:
-                self._write_csv(output_path, header, layers_with_fields)
-                self._log_message(f"Exported {output_path}", "info")
-            except OSError as exc:
-                self._show_message(f"Failed to write file '{output_path}': {exc}", "error")
+            prepared_layers = []
+            for layer, field_names in layers_with_fields:
+                transform = None
+                if not self.keep_original_crs_checkbox.isChecked():
+                    transform = self._build_transform(layer.crs(), self._get_target_crs())
+                prepared_layers.append((layer, field_names, transform))
+            group_specs.append({
+                "output_path": output_path,
+                "header": header,
+                "layers_with_fields": prepared_layers,
+            })
+
+        self._cancel_requested = False
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.cancel_button.setVisible(True)
+        self.export_button.setEnabled(False)
+        target_crs = None if self.keep_original_crs_checkbox.isChecked() else self._get_target_crs()
+        delimiter = self._get_selected_delimiter()
+        encoding = self.encoding_combo.currentText()
+        self._active_task = ExportTask(
+            "Exporting vector layers to CSV",
+            group_specs,
+            target_crs,
+            delimiter,
+            encoding,
+            self,
+        )
+        self._active_task.taskCompleted.connect(self._on_export_task_completed)
+        self._active_task.progressChanged.connect(self._on_export_task_progress)
+        QgsApplication.taskManager().addTask(self._active_task)
+
+    def _cancel_export(self):
+        if self._active_task is not None:
+            self._cancel_requested = True
+            self._active_task.cancel()
+            self._log_message("Cancellation requested; finishing the current feature and stopping soon.", "warning")
+
+    def _on_export_task_progress(self, progress):
+        self.progress_bar.setValue(progress)
+
+    def _on_export_task_completed(self, result):
+        task = self.sender()
+        if task is None:
+            return
+
+        self.progress_bar.setVisible(False)
+        self.cancel_button.setVisible(False)
+        self.export_button.setEnabled(True)
+        self._active_task = None
+
+        for message in task.messages:
+            self._log_message(message, "info" if message != "Export cancelled by the user." else "warning")
+
+        if result:
+            self._show_message("Export finished successfully.", "info")
+        else:
+            if task.error:
+                self._show_message(task.error, "error")
+            else:
+                self._show_message("Export was cancelled or failed.", "warning")
 
     def _write_csv(self, output_path, header, layers_with_fields):
-        with open(output_path, "w", encoding="utf-8", errors="replace", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n")
+        with open(output_path, "w", encoding=self.encoding_combo.currentText(), errors="replace", newline="") as handle:
+            writer = csv.writer(handle, lineterminator="\n", delimiter=self._get_selected_delimiter())
             writer.writerow(header)
 
             for layer, field_names in layers_with_fields:
@@ -133,7 +389,10 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                     )
                     continue
 
-                transform = self._build_transform(layer.crs(), self._get_wgs84_crs())
+                transform = None
+                target_crs = None if self.keep_original_crs_checkbox.isChecked() else self._get_target_crs()
+                if target_crs is not None:
+                    transform = self._build_transform(layer.crs(), target_crs)
                 field_lookup = {name.lower(): idx for idx, name in enumerate(field_names)}
 
                 if layer.featureCount() == 0:
@@ -141,14 +400,15 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
                 for feature in layer.getFeatures():
                     geometry = QgsGeometry(feature.geometry())
-                    try:
-                        geometry.transform(transform)
-                    except Exception as exc:
-                        self._log_message(
-                            f"Reprojection failed for '{layer.name()}': {exc}",
-                            "warning",
-                        )
-                        continue
+                    if transform is not None:
+                        try:
+                            geometry.transform(transform)
+                        except Exception as exc:
+                            self._log_message(
+                                f"Reprojection failed for '{layer.name()}': {exc}",
+                                "warning",
+                            )
+                            continue
 
                     row = []
                     for header_name in header[:-2]:
@@ -163,22 +423,17 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                     writer.writerow(row)
 
     def _normalize_value(self, value):
-        if value is None:
-            return ""
-        if isinstance(value, bytes):
-            return value.decode("utf-8", errors="replace")
-        if isinstance(value, str):
-            return value.encode("utf-8", errors="replace").decode("utf-8")
-        return str(value)
+        return normalize_value(value)
+
+    def _get_selected_delimiter(self):
+        selected = self.delimiter_combo.currentText()
+        return "\t" if selected == "Tab" else selected
 
     def _source_layer_column_name(self, field_names):
-        suggestion = "SOURCE_LAYER"
-        if suggestion.lower() in {name.lower() for name in field_names}:
-            return "SOURCE_LAYER_2"
-        return suggestion
+        return source_layer_column_name(field_names)
 
     def _data_header_signature(self, field_names):
-        return tuple(sorted(name.strip().lower() for name in field_names if name.strip().lower() != "geometry"))
+        return data_header_signature(field_names)
 
     def _build_group_header(self, layers_with_fields):
         header = []
@@ -193,8 +448,14 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 seen.add(normalized)
                 header.append(name)
         header.append(self._source_layer_column_name(header))
-        header.append("GEOMETRY")
+        header.append("WKT")
         return header
+
+    def _get_target_crs(self):
+        crs = self._crs_selector.crs()
+        if crs.isValid():
+            return crs
+        return self._get_wgs84_crs()
 
     def _get_wgs84_crs(self):
         try:
@@ -216,16 +477,10 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             return QgsCoordinateTransform(source_crs, destination_crs)
 
     def _sanitize_prefix(self, prefix):
-        import re
-        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", prefix.strip())
-        return sanitized or "export"
+        return sanitize_prefix(prefix)
 
     def _build_output_name(self, prefix, group_count, index):
-        if group_count == 1:
-            return f"{prefix}.csv" if not prefix.lower().endswith(".csv") else prefix
-        if prefix.lower().endswith(".csv"):
-            prefix = prefix[:-4]
-        return f"{prefix}_group{index}.csv"
+        return build_output_name(prefix, group_count, index)
 
     def _log_message(self, message, level="info"):
         prefixes = {"info": "INFO", "warning": "WARNING", "error": "ERROR"}

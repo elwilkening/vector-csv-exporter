@@ -7,7 +7,7 @@ Exports selected QGIS vector layers' attributes and geometries to CSV files, rep
 - Export multiple vector layers to CSV
 - Reproject geometries to EPSG:4326 (WGS84)
 - Group layers with identical attribute headers into a single CSV
-- Include a `GEOMETRY` column containing WKT for each feature
+- Include a `WKT` column containing WKT for each feature
 
 ## Requirements
 
@@ -31,4 +31,4 @@ Eric Wilkening with OpenAI (<elwilkening@outlook.com>)
 
 ## License
 
-MIT License — see LICENSE or include a license file as appropriate.
+MIT License — see LICENSE.

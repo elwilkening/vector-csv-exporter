@@ -18,6 +18,16 @@
      <widget class="QListWidget" name="layer_list_widget"/>
     </item>
     <item>
+     <widget class="QLabel" name="field_label">
+      <property name="text">
+       <string>Select fields to include for the selected layer:</string>
+      </property>
+     </widget>
+    </item>
+    <item>
+     <widget class="QListWidget" name="field_list_widget"/>
+    </item>
+    <item>
      <widget class="QCheckBox" name="select_all_checkbox">
       <property name="text">
        <string>Select All</string>
@@ -32,11 +42,85 @@
      </widget>
     </item>
     <item>
-     <widget class="QPushButton" name="export_button">
-      <property name="text">
-       <string>Export</string>
+     <layout class="QHBoxLayout" name="settings_layout">
+      <item>
+       <widget class="QLabel" name="delimiter_label">
+        <property name="text">
+         <string>Delimiter</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="delimiter_combo">
+        <item>
+         <property name="text">
+          <string>,</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>;</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>Tab</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLabel" name="encoding_label">
+        <property name="text">
+         <string>Encoding</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QComboBox" name="encoding_combo">
+        <item>
+         <property name="text">
+          <string>utf-8</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>latin-1</string>
+         </property>
+        </item>
+        <item>
+         <property name="text">
+          <string>cp1252</string>
+         </property>
+        </item>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <widget class="QProgressBar" name="progress_bar">
+      <property name="value">
+       <number>0</number>
       </property>
      </widget>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="horizontalLayout">
+      <item>
+       <widget class="QPushButton" name="cancel_button">
+        <property name="text">
+         <string>Cancel</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="export_button">
+        <property name="text">
+         <string>Export</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
     </item>
     <item>
      <widget class="QTextEdit" name="status_text_edit">
