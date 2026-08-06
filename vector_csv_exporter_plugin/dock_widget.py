@@ -353,9 +353,9 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             self._log_message("Cancellation requested; finishing the current feature and stopping soon.", "warning")
 
     def _on_export_task_progress(self, progress):
-        self.progress_bar.setValue(progress)
+        self.progress_bar.setValue(int(progress))
 
-    def _on_export_task_completed(self, result):
+    def _on_export_task_completed(self, result=True):
         task = self.sender()
         if task is None:
             return
