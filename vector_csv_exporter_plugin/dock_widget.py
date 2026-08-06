@@ -13,6 +13,7 @@ from qgis.core import (
     QgsProject,
     QgsTask,
     QgsVectorLayer,
+    QgsVectorLayerFeatureSource,
 )
 from qgis.gui import QgsProjectionSelectionWidget
 
@@ -26,17 +27,16 @@ from .export_utils import (
 
 
 class ExportTask(QgsTask):
-    def __init__(self, description, group_specs, target_crs, delimiter, encoding, dock_widget):
+    def __init__(self, description, group_specs, delimiter, encoding, dock_widget):
         super().__init__(description, QgsTask.CanCancel)
         self.group_specs = group_specs
-        self.target_crs = target_crs
         self.delimiter = delimiter
         self.encoding = encoding
         self.dock_widget = dock_widget
         self.messages = []
         self.error = None
         self.total_features = sum(
-            sum(layer.featureCount() for layer, _, _ in spec["layers_with_fields"]) for spec in group_specs
+            sum(layer_spec["feature_count"] for layer_spec in spec["layers_with_fields"]) for spec in group_specs
         )
         self.features_written = 0
 
@@ -62,61 +62,76 @@ class ExportTask(QgsTask):
         self.messages.append("Export completed successfully.")
         return True
 
+    def _remove_partial_output(self, output_path):
+        try:
+            os.remove(output_path)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            self.messages.append(f"Unable to remove partial file '{output_path}': {exc}")
+            return
+        self.messages.append(f"Removed partial file '{output_path}' after cancellation.")
+
     def _write_group(self, spec):
         output_path = spec["output_path"]
         header = spec["header"]
         layers_with_fields = spec["layers_with_fields"]
 
-        with open(output_path, "w", encoding=self.encoding, errors="replace", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n", delimiter=self.delimiter)
-            writer.writerow(header)
+        try:
+            with open(output_path, "w", encoding=self.encoding, errors="replace", newline="") as handle:
+                writer = csv.writer(handle, lineterminator="\n", delimiter=self.delimiter)
+                writer.writerow(header)
 
-            for layer, field_names, transform in layers_with_fields:
-                if self.isCanceled():
-                    raise RuntimeError("cancelled")
-
-                if not layer.crs().isValid():
-                    self.messages.append(
-                        f"Skipping layer '{layer.name()}': invalid or undefined source CRS.",
-                    )
-                    continue
-
-                field_lookup = {name.lower(): idx for idx, name in enumerate(field_names)}
-
-                if layer.featureCount() == 0:
-                    continue
-
-                for feature in layer.getFeatures():
+                for layer_spec in layers_with_fields:
                     if self.isCanceled():
+                        self._remove_partial_output(output_path)
                         raise RuntimeError("cancelled")
 
-                    geometry = QgsGeometry(feature.geometry())
-                    if transform is not None:
-                        try:
-                            geometry.transform(transform)
-                        except Exception as exc:
-                            self.messages.append(
-                                f"Reprojection failed for '{layer.name()}': {exc}",
-                            )
-                            continue
+                    if not layer_spec["crs_valid"]:
+                        self.messages.append(
+                            f"Skipping layer '{layer_spec['layer_name']}': invalid or undefined source CRS.",
+                        )
+                        continue
 
-                    row = []
-                    for header_name in header[:-2]:
-                        index = field_lookup.get(header_name.lower())
-                        if index is None:
-                            row.append("")
+                    field_lookup = {name.lower(): idx for idx, name in enumerate(layer_spec["field_names"])}
+
+                    if layer_spec["feature_count"] == 0:
+                        continue
+
+                    for feature in layer_spec["feature_source"].getFeatures():
+                        if self.isCanceled():
+                            self._remove_partial_output(output_path)
+                            raise RuntimeError("cancelled")
+
+                        geometry = QgsGeometry(feature.geometry())
+                        if layer_spec["transform"] is not None:
+                            try:
+                                geometry.transform(layer_spec["transform"])
+                            except Exception as exc:
+                                self.messages.append(
+                                    f"Reprojection failed for '{layer_spec['layer_name']}': {exc}",
+                                )
+                                continue
+
+                        row = []
+                        for header_name in header[:-2]:
+                            index = field_lookup.get(header_name.lower())
+                            if index is None:
+                                row.append("")
+                            else:
+                                value = feature.attributes()[index] if index < len(feature.attributes()) else None
+                                row.append(self.dock_widget._normalize_value(value))
+                        row.append(layer_spec["layer_name"])
+                        row.append(geometry.asWkt())
+                        writer.writerow(row)
+                        self.features_written += 1
+                        if self.total_features:
+                            progress = int(100 * self.features_written / self.total_features)
                         else:
-                            value = feature.attributes()[index] if index < len(feature.attributes()) else None
-                            row.append(self.dock_widget._normalize_value(value))
-                    row.append(layer.name())
-                    row.append(geometry.asWkt())
-                    writer.writerow(row)
-                    self.features_written += 1
-                    if self.total_features:
-                        progress = int(100 * self.features_written / self.total_features)
-                    else:
-                        progress = 100
-                    self.setProgress(progress)
+                            progress = 100
+                        self.setProgress(progress)
+        except RuntimeError:
+            raise
 
         self.messages.append(f"Exported {output_path}")
 
@@ -143,9 +158,9 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self._active_layer_id = None
         self._crs_selector = QgsProjectionSelectionWidget(self)
         self._crs_selector.setCrs(self._get_wgs84_crs())
-        self.verticalLayout.addWidget(self._crs_selector)
+        self.settings_layout.addWidget(self._crs_selector)
         self.keep_original_crs_checkbox = QtWidgets.QCheckBox("Keep original CRS")
-        self.verticalLayout.addWidget(self.keep_original_crs_checkbox)
+        self.settings_layout.addWidget(self.keep_original_crs_checkbox)
         self.keep_original_crs_checkbox.toggled.connect(self._update_crs_selector_state)
         self._update_crs_selector_state(False)
         self.populate_layers()
@@ -315,10 +330,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             output_path = os.path.join(output_dir, output_name)
             prepared_layers = []
             for layer, field_names in layers_with_fields:
-                transform = None
-                if not self.keep_original_crs_checkbox.isChecked():
-                    transform = self._build_transform(layer.crs(), self._get_target_crs())
-                prepared_layers.append((layer, field_names, transform))
+                prepared_layers.append(self._build_layer_export_spec(layer, field_names))
             group_specs.append({
                 "output_path": output_path,
                 "header": header,
@@ -331,13 +343,11 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.progress_bar.setVisible(True)
         self.cancel_button.setVisible(True)
         self.export_button.setEnabled(False)
-        target_crs = None if self.keep_original_crs_checkbox.isChecked() else self._get_target_crs()
         delimiter = self._get_selected_delimiter()
         encoding = self.encoding_combo.currentText()
         self._active_task = ExportTask(
             "Exporting vector layers to CSV",
             group_specs,
-            target_crs,
             delimiter,
             encoding,
             self,
@@ -376,51 +386,19 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             else:
                 self._show_message("Export was cancelled or failed.", "warning")
 
-    def _write_csv(self, output_path, header, layers_with_fields):
-        with open(output_path, "w", encoding=self.encoding_combo.currentText(), errors="replace", newline="") as handle:
-            writer = csv.writer(handle, lineterminator="\n", delimiter=self._get_selected_delimiter())
-            writer.writerow(header)
-
-            for layer, field_names in layers_with_fields:
-                if not layer.crs().isValid():
-                    self._log_message(
-                        f"Skipping layer '{layer.name()}': invalid or undefined source CRS.",
-                        "warning",
-                    )
-                    continue
-
-                transform = None
-                target_crs = None if self.keep_original_crs_checkbox.isChecked() else self._get_target_crs()
-                if target_crs is not None:
-                    transform = self._build_transform(layer.crs(), target_crs)
-                field_lookup = {name.lower(): idx for idx, name in enumerate(field_names)}
-
-                if layer.featureCount() == 0:
-                    continue
-
-                for feature in layer.getFeatures():
-                    geometry = QgsGeometry(feature.geometry())
-                    if transform is not None:
-                        try:
-                            geometry.transform(transform)
-                        except Exception as exc:
-                            self._log_message(
-                                f"Reprojection failed for '{layer.name()}': {exc}",
-                                "warning",
-                            )
-                            continue
-
-                    row = []
-                    for header_name in header[:-2]:
-                        index = field_lookup.get(header_name.lower())
-                        if index is None:
-                            row.append("")
-                        else:
-                            value = feature.attributes()[index] if index < len(feature.attributes()) else None
-                            row.append(self._normalize_value(value))
-                    row.append(layer.name())
-                    row.append(geometry.asWkt())
-                    writer.writerow(row)
+    def _build_layer_export_spec(self, layer, field_names):
+        crs = layer.crs()
+        transform = None
+        if not self.keep_original_crs_checkbox.isChecked():
+            transform = self._build_transform(crs, self._get_target_crs())
+        return {
+            "feature_source": QgsVectorLayerFeatureSource(layer),
+            "layer_name": layer.name(),
+            "crs_valid": crs.isValid(),
+            "feature_count": layer.featureCount(),
+            "field_names": field_names,
+            "transform": transform,
+        }
 
     def _normalize_value(self, value):
         return normalize_value(value)
