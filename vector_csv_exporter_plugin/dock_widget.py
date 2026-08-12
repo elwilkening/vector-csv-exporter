@@ -309,8 +309,9 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         for layer in selected_layers:
             all_field_names = [field.name().strip() for field in layer.fields()]
             selected_fields = self._layer_field_selection.get(layer.id(), set(all_field_names))
-            field_names = [name for name in all_field_names if name in selected_fields]
-            if not field_names and all_field_names:
+            # Preserve true original indices by building (orig_index, name) pairs
+            field_pairs = [(idx, name) for idx, name in enumerate(all_field_names) if name in selected_fields]
+            if not field_pairs and all_field_names:
                 self._log_message(
                     f"Layer '{layer.name()}' has no selected fields; exporting geometry-only CSV.",
                     "info",
@@ -322,19 +323,22 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 )
             # Deduplicate duplicate field names within the same layer instead
             # of skipping the layer entirely. This preserves attribute values
-            # by renaming later occurrences to unique names.
-            deduped_field_names, rename_map = dedupe_field_names(field_names)
-            if rename_map:
-                for orig_lower, canonical in rename_map.items():
-                    orig_name = next((n for n in field_names if n.strip().lower() == orig_lower), orig_lower)
+            # by renaming later occurrences to unique names. Pass (index,name)
+            # pairs so deduplication preserves true original indices.
+            deduped_field_pairs, renames = dedupe_field_names(field_pairs)
+            if renames:
+                for orig_lower, canonical, true_index in renames:
+                    orig_name = all_field_names[true_index] if true_index is not None and 0 <= true_index < len(all_field_names) else orig_lower
                     self._log_message(
                         f"Layer '{layer.name()}': duplicate field '{orig_name}' renamed to '{canonical}' to keep it in the export.",
                         "info",
                     )
-            field_names = deduped_field_names
+            field_names = deduped_field_pairs
             if layer.featureCount() == 0:
                 self._log_message(f"Layer '{layer.name()}' has zero features; exporting header only.", "warning")
-            group_key = self._data_header_signature(field_names)
+            # Build signature based on the deduplicated field names (not indices)
+            signature_names = [name for (_idx, name) in field_names]
+            group_key = self._data_header_signature(signature_names)
             grouped_layers.setdefault(group_key, []).append((layer, field_names))
 
         if not grouped_layers:
@@ -367,7 +371,9 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 # Log any renamed fields for this layer
                 for orig_lower, canonical in canonical_map.items():
                     if canonical.lower() != orig_lower:
-                        orig_name = next((n for n in field_names if n.strip().lower() == orig_lower), orig_lower)
+                        # field_names is a list of (orig_index, name) pairs; find the
+                        # original-cased name from the layer's full field list where possible.
+                        orig_name = next((n for n in all_field_names if n.strip().lower() == orig_lower), orig_lower)
                         self._log_message(f"Field '{orig_name}' from layer '{layer.name()}' was renamed to '{canonical}' to avoid colliding with reserved column names.", "warning")
 
             group_specs.append({

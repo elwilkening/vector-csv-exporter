@@ -69,11 +69,20 @@ def dedupe_field_names(field_names):
     for any renamed fields in this list.
     """
     used_lower = set()
-    new_names = []
-    rename_map = {}
-    for name in field_names:
+    new_field_pairs = []
+    renames = []  # list of tuples (orig_lower, new_name, true_index)
+
+    for item in field_names:
+        # field_names may be a list of names or (index, name) pairs; normalize
+        if isinstance(item, tuple) and len(item) >= 2:
+            orig_index, name = item[0], item[1]
+        else:
+            # no index provided; assume sequential indices (caller should provide true indices)
+            orig_index = None
+            name = item
+
         if not name or not name.strip():
-            new_names.append(name)
+            new_field_pairs.append((orig_index, name))
             continue
         normalized = name.strip()
         n_lower = normalized.lower()
@@ -81,13 +90,14 @@ def dedupe_field_names(field_names):
             # Need to pick a unique candidate that doesn't collide with
             # already used names or reserved names.
             candidate = _uniquify_name(normalized, used_lower.union(RESERVED_NAMES))
-            new_names.append(candidate)
-            rename_map[n_lower] = candidate
+            new_field_pairs.append((orig_index, candidate))
+            renames.append((n_lower, candidate, orig_index))
             used_lower.add(candidate.lower())
         else:
-            new_names.append(normalized)
+            new_field_pairs.append((orig_index, normalized))
             used_lower.add(n_lower)
-    return new_names, rename_map
+
+    return new_field_pairs, renames
 
 
 def source_layer_column_name(existing_names):
@@ -138,7 +148,13 @@ def build_group_header(layers_with_fields):
     # First pass: build canonical header names, renaming conflicting real fields
     for layer, field_names in layers_with_fields:
         layer_map = {}
-        for idx, name in enumerate(field_names):
+        # field_names may be a list of plain names or (orig_index, name) pairs
+        for entry in field_names:
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                _orig_idx, name = entry[0], entry[1]
+            else:
+                name = entry
+
             if not name or not name.strip():
                 continue
             normalized = name.strip()
@@ -174,7 +190,18 @@ def build_group_header(layers_with_fields):
     result_layer_index_maps = []
     per_layer_canonical_maps = []
     for (field_names, layer_map) in per_layer_maps:
-        orig_index = {name.strip().lower(): idx for idx, name in enumerate(field_names)}
+        # Build a mapping from original lowercased field name to the true original
+        # attribute index. field_names entries may be (orig_index, name) pairs.
+        orig_index = {}
+        seq_idx = 0
+        for entry in field_names:
+            if isinstance(entry, tuple) and len(entry) >= 2:
+                idx, name = entry[0], entry[1]
+            else:
+                idx, name = seq_idx, entry
+            seq_idx += 1
+            if name and name.strip():
+                orig_index[name.strip().lower()] = idx
         index_map = {}
         for h in header_before_reserved:
             h_lower = h.lower()

@@ -43,12 +43,21 @@ def test_data_header_signature_and_source_layer_name_are_stable():
 
 def test_dedupe_field_names_preserves_indices_and_renames():
     fields = ["Name", "name", "Value"]
-    new_fields, rename_map = dedupe_field_names(fields)
-    # Ensure rename happened for the duplicate
-    assert "w" not in ""  # noop to keep formatting consistent
+    new_fields, renames = dedupe_field_names(fields)
+    # Ensure rename happened for the duplicate and ordering/indices preserved
     assert len(new_fields) == 3
-    assert new_fields[0].lower() == "name"
+    assert new_fields[0][1].lower() == "name"
     # second field should have been renamed and not equal to first (case-insensitive)
-    assert new_fields[1].lower() != "name"
-    # rename_map should contain mapping for 'name'
-    assert "name" in rename_map
+    assert new_fields[1][1].lower() != "name"
+    # renames should include an entry for the original 'name'
+    assert any(orig == "name" for (orig, new, idx) in renames)
+
+
+def test_dedupe_field_names_three_way_duplicate():
+    fields = ["Name", "name", "NAME"]
+    new_fields, renames = dedupe_field_names(fields)
+    names = [n for (_i, n) in new_fields]
+    # All three should be distinct after deduplication
+    assert len(set(n.lower() for n in names)) == 3
+    # renames should record two rename operations (for the 2nd and 3rd)
+    assert len(renames) >= 2
