@@ -1,4 +1,4 @@
-from export_utils import (
+from vector_csv_exporter_plugin.export_utils import (
     build_output_name,
     data_header_signature,
     normalize_value,

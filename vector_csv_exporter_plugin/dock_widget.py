@@ -408,19 +408,9 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             else:
                 self._show_message("Export was cancelled or failed.", "warning")
 
-    def _build_layer_export_spec(self, layer, field_names):
-        crs = layer.crs()
-        transform = None
-        if not self.keep_original_crs_checkbox.isChecked():
-            transform = self._build_transform(crs, self._get_target_crs())
-        return {
-            "feature_source": QgsVectorLayerFeatureSource(layer),
-            "layer_name": layer.name(),
-            "crs_valid": crs.isValid(),
-            "feature_count": layer.featureCount(),
-            "field_names": field_names,
-            "transform": transform,
-        }
+    # _build_layer_export_spec was removed as its logic is constructed inline
+    # in `export_selected_layers`. Keeping this comment to avoid accidentally
+    # reintroducing dead code.
 
     def _normalize_value(self, value):
         return normalize_value(value)

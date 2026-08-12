@@ -1,5 +1,9 @@
 import re
 
+# Reserved column names appended by the plugin or treated specially.
+# Keep these lower-case for comparisons.
+RESERVED_NAMES = {"geometry", "wkt", "source_layer"}
+
 
 def normalize_value(value):
     if value is None:
@@ -39,8 +43,7 @@ def data_header_signature(field_names):
     that layers which only differ by carrying a real field named like a
     reserved column still group together.
     """
-    reserved = {"geometry", "wkt", "source_layer"}
-    return tuple(sorted(name.strip().lower() for name in field_names if name.strip() and name.strip().lower() not in reserved))
+    return tuple(sorted(name.strip().lower() for name in field_names if name.strip() and name.strip().lower() not in RESERVED_NAMES))
 
 
 def _uniquify_name(base, used_lower):
@@ -100,7 +103,7 @@ def build_group_header(layers_with_fields):
     """
     header = []
     used_map = {}  # lower -> header_name (canonical)
-    reserved = {"geometry", "wkt", "source_layer"}
+    reserved = RESERVED_NAMES
     per_layer_maps = []
 
     # First pass: build canonical header names, renaming conflicting real fields
@@ -118,9 +121,11 @@ def build_group_header(layers_with_fields):
                 layer_map[n_lower] = used_map[n_lower]
                 continue
             if n_lower in reserved:
-                # need to pick a unique renamed candidate
+                # need to pick a unique renamed candidate; register both the
+                # canonical candidate and the original lowercased reserved name
                 candidate = _uniquify_name(normalized, set(used_map.keys()).union(reserved))
                 used_map[candidate.lower()] = candidate
+                used_map[n_lower] = candidate
                 header.append(candidate)
                 layer_map[n_lower] = candidate
             else:

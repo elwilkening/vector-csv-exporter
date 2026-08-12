@@ -39,3 +39,28 @@ def test_data_header_signature_ignores_reserved():
     sig1 = data_header_signature(["Name", "WKT"])
     sig2 = data_header_signature(["Name"])  # WKT is reserved and should be ignored in signature
     assert sig1 == sig2
+
+
+def test_multiple_layers_same_reserved_field_rename():
+    # Two layers both have a real 'WKT' field; they should map to the same
+    # canonical renamed header column (not two different renamed variants).
+    layers = [
+        ("layerA", ["id", "WKT"]),
+        ("layerB", ["id", "WKT"]),
+        ("layerC", ["id", "name"]),
+    ]
+    header, maps, canon = build_group_header(layers)
+
+    # Find the canonical renamed header for the WKT field from the first layer
+    first_map = canon[0]
+    assert "wkt" in first_map
+    renamed = first_map["wkt"]
+    assert renamed.lower() != "wkt"
+
+    # The second layer should map its 'wkt' too, and it must match the same name
+    second_map = canon[1]
+    assert second_map.get("wkt") == renamed
+
+    # Header should contain only one occurrence of the renamed column
+    occurrences = [h for h in header[:-2] if h == renamed]
+    assert len(occurrences) == 1
