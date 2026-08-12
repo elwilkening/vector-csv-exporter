@@ -2,6 +2,8 @@
 
 Exports selected QGIS vector layers' attributes and geometries to CSV files, reprojecting geometries to WGS84 and grouping layers with matching headers.
 
+[![CI](https://github.com/elwilkening/Python/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/elwilkening/Python/actions)
+
 ## Features
 
 - Export multiple vector layers to CSV

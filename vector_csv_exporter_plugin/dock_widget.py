@@ -23,6 +23,7 @@ from .export_utils import (
     normalize_value,
     sanitize_prefix,
     source_layer_column_name,
+    build_group_header,
 )
 
 
@@ -93,7 +94,8 @@ class ExportTask(QgsTask):
                         )
                         continue
 
-                    field_lookup = {name.lower(): idx for idx, name in enumerate(layer_spec["field_names"])}
+                    # header_index_map maps header_name.lower() -> attribute index (or None)
+                    field_lookup = layer_spec.get("header_index_map", {})
 
                     if layer_spec["feature_count"] == 0:
                         continue
@@ -325,12 +327,32 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         group_count = len(grouped_layers)
         group_specs = []
         for index, (_, layers_with_fields) in enumerate(grouped_layers.items(), start=1):
-            header = self._build_group_header(layers_with_fields)
+            # Build a collision-safe header and per-layer index maps
+            header, per_layer_index_maps, per_layer_canonical_maps = build_group_header(layers_with_fields)
             output_name = self._build_output_name(prefix, group_count, index)
             output_path = os.path.join(output_dir, output_name)
             prepared_layers = []
-            for layer, field_names in layers_with_fields:
-                prepared_layers.append(self._build_layer_export_spec(layer, field_names))
+            for (layer, field_names), index_map, canonical_map in zip(layers_with_fields, per_layer_index_maps, per_layer_canonical_maps):
+                transform = None
+                if not self.keep_original_crs_checkbox.isChecked():
+                    transform = self._build_transform(layer.crs(), self._get_target_crs())
+                layer_spec = {
+                    "feature_source": QgsVectorLayerFeatureSource(layer),
+                    "layer_name": layer.name(),
+                    "crs_valid": layer.crs().isValid(),
+                    "feature_count": layer.featureCount(),
+                    "field_names": field_names,
+                    "transform": transform,
+                    "header_index_map": index_map,
+                    "canonical_map": canonical_map,
+                }
+                prepared_layers.append(layer_spec)
+                # Log any renamed fields for this layer
+                for orig_lower, canonical in canonical_map.items():
+                    if canonical.lower() != orig_lower:
+                        orig_name = next((n for n in field_names if n.strip().lower() == orig_lower), orig_lower)
+                        self._log_message(f"Field '{orig_name}' from layer '{layer.name()}' was renamed to '{canonical}' to avoid colliding with reserved column names.", "warning")
+
             group_specs.append({
                 "output_path": output_path,
                 "header": header,
@@ -412,22 +434,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
     def _data_header_signature(self, field_names):
         return data_header_signature(field_names)
-
-    def _build_group_header(self, layers_with_fields):
-        header = []
-        seen = set()
-        for _, field_names in layers_with_fields:
-            for name in field_names:
-                normalized = name.strip().lower()
-                if normalized == "geometry":
-                    continue
-                if normalized in seen:
-                    continue
-                seen.add(normalized)
-                header.append(name)
-        header.append(self._source_layer_column_name(header))
-        header.append("WKT")
-        return header
+    # group header construction is handled by export_utils.build_group_header
 
     def _get_target_crs(self):
         crs = self._crs_selector.crs()
