@@ -12,8 +12,7 @@ Exports selected QGIS vector layers' attributes and geometries to CSV files, rep
 - Include a `WKT` column containing WKT for each feature
 
 ## Requirements
-
-- QGIS >= 3.4
+- QGIS >= 3.44
 - Python 3 (as provided by QGIS)
 
 ## Installation

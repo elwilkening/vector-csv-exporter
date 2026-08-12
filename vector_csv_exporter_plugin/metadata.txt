@@ -1,6 +1,6 @@
 [general]
 name=Vector CSV Exporter
-qgisMinimumVersion=3.4
+qgisMinimumVersion=3.44
 description=Exports selected vector layer attributes and geometries to CSV files
 version=1.0.0
 author=Eric Wilkening with OpenAI

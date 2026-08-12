@@ -24,6 +24,7 @@ from .export_utils import (
     sanitize_prefix,
     source_layer_column_name,
     build_group_header,
+    dedupe_field_names,
 )
 
 
@@ -127,6 +128,14 @@ class ExportTask(QgsTask):
                         row.append(geometry.asWkt())
                         writer.writerow(row)
                         self.features_written += 1
+                        # Periodically flush to ensure large exports leave
+                        # more data on-disk in case of a crash. Flush every 1000 rows.
+                        if self.features_written % 1000 == 0:
+                            try:
+                                handle.flush()
+                            except Exception:
+                                # Ignore flush errors; file will be removed on cancel/failure
+                                pass
                         if self.total_features:
                             progress = int(100 * self.features_written / self.total_features)
                         else:
@@ -311,10 +320,18 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                     f"Layer '{layer.name()}' has zero attribute fields; exporting geometry-only CSV.",
                     "info",
                 )
-            normalized_names = [name.lower() for name in field_names]
-            if len(set(normalized_names)) != len(field_names):
-                self._log_message(f"Skipping layer '{layer.name()}': duplicate field names detected.", "warning")
-                continue
+            # Deduplicate duplicate field names within the same layer instead
+            # of skipping the layer entirely. This preserves attribute values
+            # by renaming later occurrences to unique names.
+            deduped_field_names, rename_map = dedupe_field_names(field_names)
+            if rename_map:
+                for orig_lower, canonical in rename_map.items():
+                    orig_name = next((n for n in field_names if n.strip().lower() == orig_lower), orig_lower)
+                    self._log_message(
+                        f"Layer '{layer.name()}': duplicate field '{orig_name}' renamed to '{canonical}' to keep it in the export.",
+                        "info",
+                    )
+            field_names = deduped_field_names
             if layer.featureCount() == 0:
                 self._log_message(f"Layer '{layer.name()}' has zero features; exporting header only.", "warning")
             group_key = self._data_header_signature(field_names)

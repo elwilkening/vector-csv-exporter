@@ -4,6 +4,7 @@ from vector_csv_exporter_plugin.export_utils import (
     normalize_value,
     sanitize_prefix,
     source_layer_column_name,
+    dedupe_field_names,
 )
 
 
@@ -38,3 +39,16 @@ def test_data_header_signature_and_source_layer_name_are_stable():
     assert data_header_signature(["Name", "Geometry", "Age"]) == ("age", "name")
     assert source_layer_column_name(["id", "name"]) == "SOURCE_LAYER"
     assert source_layer_column_name(["SOURCE_LAYER", "name"]) == "SOURCE_LAYER_2"
+
+
+def test_dedupe_field_names_preserves_indices_and_renames():
+    fields = ["Name", "name", "Value"]
+    new_fields, rename_map = dedupe_field_names(fields)
+    # Ensure rename happened for the duplicate
+    assert "w" not in ""  # noop to keep formatting consistent
+    assert len(new_fields) == 3
+    assert new_fields[0].lower() == "name"
+    # second field should have been renamed and not equal to first (case-insensitive)
+    assert new_fields[1].lower() != "name"
+    # rename_map should contain mapping for 'name'
+    assert "name" in rename_map

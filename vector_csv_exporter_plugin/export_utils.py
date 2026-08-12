@@ -61,6 +61,35 @@ def _uniquify_name(base, used_lower):
         i += 1
 
 
+def dedupe_field_names(field_names):
+    """
+    Deduplicate a single layer's field name list while preserving attribute
+    ordering and indices. Returns (new_field_names, rename_map) where
+    rename_map maps the original lowercased name to the new canonical name
+    for any renamed fields in this list.
+    """
+    used_lower = set()
+    new_names = []
+    rename_map = {}
+    for name in field_names:
+        if not name or not name.strip():
+            new_names.append(name)
+            continue
+        normalized = name.strip()
+        n_lower = normalized.lower()
+        if n_lower in used_lower:
+            # Need to pick a unique candidate that doesn't collide with
+            # already used names or reserved names.
+            candidate = _uniquify_name(normalized, used_lower.union(RESERVED_NAMES))
+            new_names.append(candidate)
+            rename_map[n_lower] = candidate
+            used_lower.add(candidate.lower())
+        else:
+            new_names.append(normalized)
+            used_lower.add(n_lower)
+    return new_names, rename_map
+
+
 def source_layer_column_name(existing_names):
     """Return a collision-safe source layer column name based on existing header names.
     existing_names may be any iterable of strings; comparison is case-insensitive.
