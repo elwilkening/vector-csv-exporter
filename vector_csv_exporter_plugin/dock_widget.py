@@ -75,12 +75,16 @@ class ExportTask(QgsTask):
                 if str(exc) == "cancelled":
                     self._log("Export cancelled by the user.", "warning")
                     return False
+                self._remove_partial_output(spec["output_path"])
                 self.error = str(exc)
                 self._log(f"Export failed: {exc}", "error")
+                self._write_manifest("ERROR")
                 return False
             except OSError as exc:
+                self._remove_partial_output(spec["output_path"])
                 self.error = str(exc)
                 self._log(f"Failed to write file '{spec['output_path']}': {exc}", "error")
+                self._write_manifest("ERROR")
                 return False
 
         # Reconciliation: total_features was computed up front from each

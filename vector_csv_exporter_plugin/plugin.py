@@ -34,7 +34,7 @@ class VectorCsvExporterPlugin(object):
 
     def unload(self):
         if self.action is not None:
-            self.iface.removePluginMenu("&Vector", self.action)
+            self.iface.removePluginVectorMenu("&Vector", self.action)
             self.iface.removeToolBarIcon(self.action)
             self.action.deleteLater()
             self.action = None
