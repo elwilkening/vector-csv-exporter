@@ -96,13 +96,13 @@ class ExportTask(QgsTask):
                 if str(exc) == "cancelled":
                     self._log("Export cancelled by the user.", "warning")
                     return False
-                self._remove_partial_output(spec["output_path"])
+                self._remove_partial_output(spec["output_path"], reason="an export failure")
                 self.error = str(exc)
                 self._log(f"Export failed: {exc}", "error")
                 self._write_manifest("ERROR")
                 return False
             except OSError as exc:
-                self._remove_partial_output(spec["output_path"])
+                self._remove_partial_output(spec["output_path"], reason="a write failure")
                 self.error = str(exc)
                 self._log(f"Failed to write file '{spec['output_path']}': {exc}", "error")
                 self._write_manifest("ERROR")
@@ -155,7 +155,7 @@ class ExportTask(QgsTask):
         self._log("Export completed successfully.")
         return True
 
-    def _remove_partial_output(self, output_path):
+    def _remove_partial_output(self, output_path, reason="cancellation"):
         try:
             os.remove(output_path)
         except FileNotFoundError:
@@ -163,7 +163,7 @@ class ExportTask(QgsTask):
         except OSError as exc:
             self._log(f"Unable to remove partial file '{output_path}': {exc}", "warning")
             return
-        self._log(f"Removed partial file '{output_path}' after cancellation.")
+        self._log(f"Removed partial file '{output_path}' after {reason}.")
 
     def _write_group(self, spec):
         output_path = spec["output_path"]
