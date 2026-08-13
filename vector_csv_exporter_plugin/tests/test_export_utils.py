@@ -56,9 +56,30 @@ def test_sanitize_prefix_replaces_invalid_characters():
     assert sanitize_prefix("   ") == "export"
 
 
+def test_sanitize_prefix_strips_csv_extension():
+    assert sanitize_prefix("data.csv") == "data"
+    assert sanitize_prefix("data.CSV") == "data"
+    # A bare ".csv" would otherwise produce a file literally named ".csv"
+    assert sanitize_prefix(".csv") == "export"
+
+
+def test_sanitize_prefix_defuses_windows_reserved_device_names():
+    # NUL.csv resolves to the null device on Windows: the export would
+    # "succeed" while every row vanishes.
+    assert sanitize_prefix("NUL") == "NUL_"
+    assert sanitize_prefix("con") == "con_"
+    assert sanitize_prefix("COM1") == "COM1_"
+    assert sanitize_prefix("nul.csv") == "nul_"
+    assert sanitize_prefix("console") == "console"  # not reserved, unchanged
+
+
 def test_build_output_name_uses_group_suffix_when_needed():
     assert build_output_name("export", 2, 1) == "export_group1.csv"
     assert build_output_name("export.csv", 1, 1) == "export.csv"
+    # Multi-group with a .csv-suffixed prefix must strip the extension
+    # before appending the group suffix (any casing).
+    assert build_output_name("export.csv", 3, 2) == "export_group2.csv"
+    assert build_output_name("export.CSV", 2, 1) == "export_group1.csv"
 
 
 def test_data_header_signature_and_source_layer_name_are_stable():

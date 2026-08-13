@@ -2,16 +2,28 @@
 name=Vector CSV Exporter
 qgisMinimumVersion=3.44
 description=Exports selected vector layer attributes and geometries to CSV files
-version=1.1.0
+version=1.2.0
 author=Eric Wilkening with OpenAI
 email=elwilkening@outlook.com
-about=This plugin exports selected vector layers to one or more CSV files, reprojecting geometries to WGS84 and grouping layers by matching field names.
+about=This plugin exports selected vector layers to one or more CSV files, reprojecting geometries to WGS84 (or a chosen CRS) and grouping layers by matching field names. Writes a .csvt field-type sidecar and a per-run audit manifest with row-count and feature-ID verification.
 tracker=https://github.com/elwilkening/Python/issues
 repository=https://github.com/elwilkening/Python
 category=Vector
-icon=icon.png
 experimental=False
 deprecated=False
-
-[files]
-python_files=__init__.py, plugin.py, dock_widget.py
+changelog=
+    1.2.0
+    - Fixed cancelled/failed exports leaving the UI stuck and their log unshown
+    - Dates, times, and booleans now export in GDAL-compatible formats matching the .csvt
+    - Fields named 'geometry' are renamed and kept instead of silently dropped
+    - Formula escaping now covers layer names, headers, and tab/CR prefixes, and is a visible optional setting
+    - Manifest written on cancellation; deleted partial outputs no longer counted as exported
+    - Lossy-encoding exports report replaced characters instead of silently certifying success
+    - Layer/field selections survive Refresh; fields added mid-session are exported
+    - Unloading the plugin cancels a running export instead of orphaning it
+    1.1.0
+    - CSVT field-type sidecar, overwrite warning, CRS reprojection pre-check
+    - Per-layer accounting, export summary, row-count and feature-ID verification, audit manifest
+    - WKT coordinate precision, NULL handling, CSV-injection protection
+    1.0.0
+    - Initial release

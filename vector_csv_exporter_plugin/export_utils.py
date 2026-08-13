@@ -44,8 +44,26 @@ def _escape_for_csv(text, escape_formulas=True):
     return text
 
 
+# Windows reserved device names: a file called e.g. NUL.csv resolves to the
+# null device on many Windows builds, so an export "succeeds" while every row
+# vanishes. Reserved regardless of extension.
+_WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
 def sanitize_prefix(prefix):
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", prefix.strip())
+    # A prefix already ending in .csv would double up with the extension
+    # build_output_name adds (and a bare ".csv" would yield a file literally
+    # named ".csv"); strip it here so the rest of the pipeline never sees it.
+    if sanitized.lower().endswith(".csv"):
+        sanitized = sanitized[:-4]
+    stem = sanitized.split(".")[0].lower()
+    if stem in _WINDOWS_RESERVED_NAMES:
+        sanitized = f"{sanitized}_"
     return sanitized or "export"
 
 

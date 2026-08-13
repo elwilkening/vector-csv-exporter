@@ -35,6 +35,20 @@ def test_source_layer_field_renamed():
     assert header[-1].lower() == "wkt"
 
 
+def test_index_maps_preserve_non_sequential_original_indices():
+    # When the user deselects fields, the (orig_index, name) pairs are
+    # non-sequential -- e.g. fields 0 and 2 of a 3-field layer. The index
+    # maps must point each header column at the TRUE attribute index, not a
+    # renumbered sequential one, or values are read from the wrong column.
+    layers = [("layer", [(0, "id"), (2, "value"), (5, "note")])]
+    header, maps, _canon = build_group_header(layers)
+
+    index_map = maps[0]
+    assert index_map["id"] == 0
+    assert index_map["value"] == 2
+    assert index_map["note"] == 5
+
+
 def test_geometry_named_field_is_renamed_not_dropped():
     # Regression: a real attribute field literally named 'geometry' used to
     # be silently dropped from the export (no column, no log). It must be

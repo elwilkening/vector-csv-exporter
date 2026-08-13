@@ -1,6 +1,6 @@
 """
 Manual QGIS integration test #29: CSVT field-type sidecar.
-Runs the real ExportTask/_build_column_types production code (no GUI needed)
+Runs the real ExportTask/build_column_types production code (no GUI needed)
 against a real QgsVectorLayer and checks the resulting .csvt content.
 """
 import csv
@@ -13,7 +13,7 @@ start_qgis_gui()
 
 from qgis.core import QgsVectorLayerFeatureSource  # noqa: E402
 
-from vector_csv_exporter_plugin.dock_widget import ExportTask, VectorCsvExporterDockWidget  # noqa: E402
+from vector_csv_exporter_plugin.dock_widget import ExportTask, build_column_types  # noqa: E402
 from vector_csv_exporter_plugin.export_utils import build_group_header  # noqa: E402
 
 layer = load_csv_layer("mixed_types.csv", "mixed_types")
@@ -24,7 +24,7 @@ print("Detected fields:", [(f.name(), f.typeName()) for f in layer.fields()])
 header, index_maps, canonical_maps = build_group_header([(layer, field_pairs)])
 print("Header:", header)
 
-column_types = VectorCsvExporterDockWidget._build_column_types(None, header, [(layer, field_pairs)], index_maps)
+column_types = build_column_types(header, [(layer, field_pairs)], index_maps)
 print("Resolved column_types:", column_types)
 
 out_dir = tempfile.mkdtemp(prefix="csvt_test_")

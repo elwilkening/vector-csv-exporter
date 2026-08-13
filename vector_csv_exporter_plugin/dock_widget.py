@@ -77,6 +77,48 @@ def _csvt_type_for_field(field):
     return _CSVT_TYPE_MAP.get(field.type(), "String")
 
 
+def _widen_csvt_types(column, seen_types, log=None):
+    if not seen_types:
+        return "String"
+    unique = set(seen_types)
+    if len(unique) == 1:
+        return seen_types[0]
+    if unique <= {"Integer", "Integer64"}:
+        widened = "Integer64"
+    elif unique <= {"Integer", "Integer64", "Real"}:
+        widened = "Real"
+    else:
+        widened = "String"
+    if log is not None:
+        log(
+            f"Column '{column}' has different field types across grouped layers "
+            f"({', '.join(sorted(unique))}); declaring it {widened} in the .csvt sidecar.",
+            "warning",
+        )
+    return widened
+
+
+def build_column_types(header, layers_with_fields, per_layer_index_maps, log=None):
+    """Determine a CSVT field type for each real attribute column.
+
+    Layers are grouped by field NAME only, so two layers can share a column
+    while disagreeing on its type -- collect the type from EVERY contributing
+    layer and widen on disagreement (Integer+Integer64 -> Integer64, +Real ->
+    Real, else String), otherwise the .csvt would coerce one layer's values
+    to garbage on re-import."""
+    column_types = []
+    for column in header[:-2]:
+        column_lower = column.lower()
+        seen_types = []
+        for (layer, _field_names), index_map in zip(layers_with_fields, per_layer_index_maps):
+            true_index = index_map.get(column_lower)
+            if true_index is not None:
+                seen_types.append(_csvt_type_for_field(layer.fields().at(true_index)))
+        column_types.append(_widen_csvt_types(column, seen_types, log))
+    column_types.extend(["String", "String"])  # SOURCE_LAYER, WKT
+    return column_types
+
+
 def prepare_attribute_value(value, escape_formulas=True):
     """Convert a raw PyQGIS attribute to its CSV cell string.
 
@@ -791,7 +833,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             header, per_layer_index_maps, per_layer_canonical_maps = build_group_header(layers_with_fields)
             output_name = self._build_output_name(prefix, group_count, index)
             output_path = os.path.join(output_dir, output_name)
-            column_types = self._build_column_types(header, layers_with_fields, per_layer_index_maps)
+            column_types = build_column_types(header, layers_with_fields, per_layer_index_maps, log=self._log_message)
             prepared_layers = []
             for (layer, field_names), index_map, canonical_map in zip(layers_with_fields, per_layer_index_maps, per_layer_canonical_maps):
                 transform = None
@@ -1023,43 +1065,6 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         except QgsCsException:
             return False
         return True
-
-    def _build_column_types(self, header, layers_with_fields, per_layer_index_maps):
-        # Determine a CSVT field type for each real attribute column. Layers
-        # are grouped by field NAME only, so two layers can share a column
-        # while disagreeing on its type -- collect the type from EVERY
-        # contributing layer and widen on disagreement, otherwise the .csvt
-        # would coerce one layer's values to garbage on re-import.
-        column_types = []
-        for column in header[:-2]:
-            column_lower = column.lower()
-            seen_types = []
-            for (layer, _field_names), index_map in zip(layers_with_fields, per_layer_index_maps):
-                true_index = index_map.get(column_lower)
-                if true_index is not None:
-                    seen_types.append(_csvt_type_for_field(layer.fields().at(true_index)))
-            column_types.append(self._widen_csvt_types(column, seen_types))
-        column_types.extend(["String", "String"])  # SOURCE_LAYER, WKT
-        return column_types
-
-    def _widen_csvt_types(self, column, seen_types):
-        if not seen_types:
-            return "String"
-        unique = set(seen_types)
-        if len(unique) == 1:
-            return seen_types[0]
-        if unique <= {"Integer", "Integer64"}:
-            widened = "Integer64"
-        elif unique <= {"Integer", "Integer64", "Real"}:
-            widened = "Real"
-        else:
-            widened = "String"
-        self._log_message(
-            f"Column '{column}' has different field types across grouped layers "
-            f"({', '.join(sorted(unique))}); declaring it {widened} in the .csvt sidecar.",
-            "warning",
-        )
-        return widened
 
     def _sanitize_prefix(self, prefix):
         return sanitize_prefix(prefix)
