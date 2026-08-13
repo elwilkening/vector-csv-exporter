@@ -100,34 +100,30 @@ def dedupe_field_names(field_names):
     return new_field_pairs, renames
 
 
+def _collision_safe_name(base, existing_names):
+    """Return `base`, or a `base_2`, `base_3`, ... variant, whichever doesn't
+    collide case-insensitively with any name in existing_names."""
+    used = {n.lower() for n in existing_names}
+    if base.lower() not in used:
+        return base
+    i = 2
+    while True:
+        candidate = f"{base}_{i}"
+        if candidate.lower() not in used:
+            return candidate
+        i += 1
+
+
 def source_layer_column_name(existing_names):
     """Return a collision-safe source layer column name based on existing header names.
     existing_names may be any iterable of strings; comparison is case-insensitive.
     """
-    used = {n.lower() for n in existing_names}
-    base = "SOURCE_LAYER"
-    if base.lower() not in used:
-        return base
-    i = 2
-    while True:
-        candidate = f"{base}_{i}"
-        if candidate.lower() not in used:
-            return candidate
-        i += 1
+    return _collision_safe_name("SOURCE_LAYER", existing_names)
 
 
 def wkt_column_name(existing_names):
     """Return a collision-safe WKT column name based on existing header names."""
-    used = {n.lower() for n in existing_names}
-    base = "WKT"
-    if base.lower() not in used:
-        return base
-    i = 2
-    while True:
-        candidate = f"{base}_{i}"
-        if candidate.lower() not in used:
-            return candidate
-        i += 1
+    return _collision_safe_name("WKT", existing_names)
 
 
 def build_group_header(layers_with_fields):

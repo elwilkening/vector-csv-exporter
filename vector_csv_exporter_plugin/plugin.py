@@ -1,7 +1,7 @@
 import os
 
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtWidgets import QAction, QDockWidget
+from qgis.PyQt.QtWidgets import QAction
 from qgis.core import QgsMapLayer
 
 from .dock_widget import VectorCsvExporterDockWidget

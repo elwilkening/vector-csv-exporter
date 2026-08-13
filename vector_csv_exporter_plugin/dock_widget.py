@@ -9,6 +9,7 @@ from qgis.core import (
     QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsCsException,
     QgsGeometry,
     QgsMapLayer,
     QgsMessageLog,
@@ -24,7 +25,6 @@ from .export_utils import (
     data_header_signature,
     normalize_value,
     sanitize_prefix,
-    source_layer_column_name,
     build_group_header,
     dedupe_field_names,
 )
@@ -102,12 +102,12 @@ class ExportTask(QgsTask):
                 "warning",
             )
 
-        status = "SUCCESS"
+        status_parts = []
         if self.verification_failures:
-            status = "ROW_COUNT_MISMATCH"
+            status_parts.append("ROW_COUNT_MISMATCH")
         if self.id_verification_failures:
-            status = status + "+FEATURE_ID_MISMATCH" if status != "SUCCESS" else "FEATURE_ID_MISMATCH"
-        self._write_manifest(status)
+            status_parts.append("FEATURE_ID_MISMATCH")
+        self._write_manifest("+".join(status_parts) or "SUCCESS")
 
         if self.verification_failures or self.id_verification_failures:
             error_parts = []
@@ -209,7 +209,7 @@ class ExportTask(QgsTask):
                         if layer_spec["transform"] is not None:
                             try:
                                 geometry.transform(layer_spec["transform"])
-                            except Exception as exc:
+                            except QgsCsException as exc:
                                 self._log(f"Reprojection failed for '{layer_name}': {exc}", "warning")
                                 layer_stat["skipped"] += 1
                                 layer_stat["skip_reasons"]["reprojection failed"] = (
@@ -389,7 +389,6 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.progress_bar.setVisible(False)
         self.cancel_button.setVisible(False)
         self._active_task = None
-        self._cancel_requested = False
         self._settings = QtCore.QSettings("QGIS", "VectorCsvExporter")
         self._layer_field_selection = {}
         self._active_layer_id = None
@@ -630,7 +629,6 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             manifest_path = os.path.join(output_dir, f"{manifest_prefix}_manifest_{suffix}.csv")
             suffix += 1
 
-        self._cancel_requested = False
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
@@ -652,7 +650,6 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
     def _cancel_export(self):
         if self._active_task is not None:
-            self._cancel_requested = True
             self._active_task.cancel()
             self._log_message("Cancellation requested; finishing the current feature and stopping soon.", "warning")
 
@@ -680,10 +677,6 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             else:
                 self._show_message("Export was cancelled or failed.", "warning")
 
-    # _build_layer_export_spec was removed as its logic is constructed inline
-    # in `export_selected_layers`. Keeping this comment to avoid accidentally
-    # reintroducing dead code.
-
     def _normalize_value(self, value):
         # PyQGIS represents a null attribute with its own NULL sentinel, which
         # is not Python's None, so it must be converted here before reaching
@@ -696,12 +689,8 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         selected = self.delimiter_combo.currentText()
         return "\t" if selected == "Tab" else selected
 
-    def _source_layer_column_name(self, field_names):
-        return source_layer_column_name(field_names)
-
     def _data_header_signature(self, field_names):
         return data_header_signature(field_names)
-    # group header construction is handled by export_utils.build_group_header
 
     def _get_target_crs(self):
         crs = self._crs_selector.crs()
