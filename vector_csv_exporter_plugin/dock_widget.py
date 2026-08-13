@@ -3,6 +3,7 @@ import os
 
 from qgis.PyQt import QtCore, QtWidgets, uic
 from qgis.core import (
+    NULL,
     Qgis,
     QgsApplication,
     QgsCoordinateReferenceSystem,
@@ -442,6 +443,11 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
     # reintroducing dead code.
 
     def _normalize_value(self, value):
+        # PyQGIS represents a null attribute with its own NULL sentinel, which
+        # is not Python's None, so it must be converted here before reaching
+        # the QGIS-independent normalize_value() helper.
+        if value == NULL:
+            value = None
         return normalize_value(value)
 
     def _get_selected_delimiter(self):
