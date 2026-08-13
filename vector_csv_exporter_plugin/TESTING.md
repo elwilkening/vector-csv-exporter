@@ -12,10 +12,15 @@ pytest -q
 CI (`.github/workflows/ci.yml`) runs this on every push/PR to `main` across Python 3.10-3.12.
 
 Everything in `dock_widget.py` (`VectorCsvExporterDockWidget`, `ExportTask`) depends on live PyQGIS
-objects and cannot be unit-tested outside QGIS. The checklist below covers that code manually --
-install the plugin into a QGIS 3.44+ profile (via Plugin Reloader or by copying
-`vector_csv_exporter_plugin` into the profile's `python/plugins` folder) and work through it before
-a release or after any change to `dock_widget.py`.
+objects and cannot be covered by that pytest suite. Most of it still has to be checked manually via
+the checklist below -- install the plugin into a QGIS 3.44+ profile (via Plugin Reloader or by
+copying `vector_csv_exporter_plugin` into the profile's `python/plugins` folder) and work through it
+before a release or after any change to `dock_widget.py`.
+
+A handful of items (marked below with a script name) are instead covered by real, runnable
+integration tests in `manual_qgis_tests/`, using the Python interpreter QGIS ships with -- see
+`manual_qgis_tests/README.md` for how to run them. They exercise the actual plugin code headlessly
+(no QGIS window ever opens) and were how the bug noted under item #36 was actually found.
 
 ## Setup / lifecycle
 
@@ -76,10 +81,11 @@ a release or after any change to `dock_widget.py`.
     CRS.
 21. **WKT precision**: open an exported CSV and inspect coordinate values -- confirm no long
     floating-point tails (e.g. `-97.74` not `-97.73999999999999488`).
-22. **CRS pre-check**: select a layer whose CRS cannot be reprojected to the target CRS (e.g. a
-    layer with an invalid/undefined CRS and "Keep original CRS" unchecked) -- confirm a warning
-    dialog appears *before* the export starts, naming the affected layer, rather than only
-    discovering the problem feature-by-feature deep into the run.
+22. **CRS pre-check** (`manual_qgis_tests/test_22_crs_precheck.py`): select a layer whose CRS cannot
+    be reprojected to the target CRS -- confirm a warning dialog appears *before* the export starts,
+    naming the affected layer, rather than only discovering the problem feature-by-feature deep into
+    the run. (Note: an invalid/undefined CRS alone doesn't reliably trigger this in practice -- see
+    the script for why it mocks the reachability check instead.)
 
 ## CSV formatting
 
@@ -95,15 +101,15 @@ a release or after any change to `dock_widget.py`.
     (e.g. `My_Export_1`) in the filename.
 27. Point the output directory at a read-only location -- confirm the plugin reports the
     write-permission error rather than failing silently or crashing.
-28. **Overwrite warning**: run the same export twice into the same directory with the same prefix --
-    confirm the second run shows a confirmation dialog listing the files that will be overwritten
-    (group CSV(s), `.csvt` sidecar(s), and manifest), and that declining aborts without touching any
-    files.
-29. **CSVT sidecar**: after export, confirm a `<output>.csvt` file exists next to each group CSV,
-    with one quoted type per column matching the header (e.g. `"Integer","String","Real",...,
-    "String","String"` -- the last two always `String` for `SOURCE_LAYER`/`WKT`). Re-import the CSV
-    into QGIS via "Add Delimited Text Layer" and confirm numeric/date fields come back typed instead
-    of as text.
+28. **Overwrite warning** (`manual_qgis_tests/test_28_overwrite_warning.py`): run the same export
+    twice into the same directory with the same prefix -- confirm the second run shows a
+    confirmation dialog listing the files that will be overwritten (group CSV(s), `.csvt`
+    sidecar(s), and manifest), and that declining aborts without touching any files.
+29. **CSVT sidecar** (`manual_qgis_tests/test_29_csvt.py`): after export, confirm a `<output>.csvt`
+    file exists next to each group CSV, with one quoted type per column matching the header (e.g.
+    `"Integer","String","Real",...,"String","String"` -- the last two always `String` for
+    `SOURCE_LAYER`/`WKT`). Re-import the CSV into QGIS via "Add Delimited Text Layer" and confirm
+    numeric/date fields come back typed instead of as text.
 
 ## Progress / cancellation
 
@@ -125,10 +131,11 @@ a release or after any change to `dock_widget.py`.
     skip_reasons, missing_feature_ids, unexpected_feature_ids`), a `TOTAL` row, and
     `export_status`/`generated_at`/`delimiter`/`encoding` metadata rows -- confirm the `TOTAL` row
     matches the `Summary` log line.
-36. Force a partial failure (e.g. point the output directory at a location that becomes unwritable
-    partway through a multi-group export, or revoke write permission mid-run) -- confirm the manifest
-    is still written (with `export_status` reflecting the error) and that the partially-written
-    output CSV for the failing group is cleaned up, not left corrupt on disk.
+36. **Partial failure** (`manual_qgis_tests/test_36_partial_failure.py`): force a partial failure
+    (e.g. point the output directory at a location that becomes unwritable partway through a
+    multi-group export, or revoke write permission mid-run) -- confirm the manifest is still written
+    (with `export_status` reflecting the error) and that the partially-written output CSV for the
+    failing group is cleaned up, not left corrupt on disk.
 37. If feasible, edit a layer's features while an export of it is running -- confirm the feature-ID
     verification logs an `unexpected feature ID(s)` warning rather than silently ignoring the
     mismatch.
@@ -142,4 +149,5 @@ a bug that has actually shipped before:
 - #21 above (WKT floating-point precision)
 - #17 above (PyQGIS `NULL` rendering as literal text)
 - #3 above (plugin unload menu removal)
-- #36 above (partial-file cleanup and manifest on hard failure)
+- #36 above (partial-file cleanup and manifest on hard failure; also asserts the cleanup log message
+  correctly describes the write failure instead of always saying "after cancellation")
