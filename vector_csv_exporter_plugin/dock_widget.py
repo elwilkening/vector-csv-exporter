@@ -47,27 +47,61 @@ class ExportTask(QgsTask):
             sum(layer_spec["feature_count"] for layer_spec in spec["layers_with_fields"]) for spec in group_specs
         )
         self.features_written = 0
+        self.features_skipped = 0
+        # Per-layer accounting (attempted/written/skipped) so the final
+        # summary can reconcile every feature instead of just reporting a
+        # single running total. Also the basis for a future export manifest.
+        self.layer_stats = []
+        self.verification_failures = []
+
+    def _log(self, text, level="info"):
+        self.messages.append((text, level))
 
     def run(self):
         for spec in self.group_specs:
             if self.isCanceled():
-                self.messages.append("Export cancelled by the user.")
+                self._log("Export cancelled by the user.", "warning")
                 return False
             try:
                 self._write_group(spec)
             except RuntimeError as exc:
                 if str(exc) == "cancelled":
-                    self.messages.append("Export cancelled by the user.")
+                    self._log("Export cancelled by the user.", "warning")
                     return False
                 self.error = str(exc)
-                self.messages.append(f"Export failed: {exc}")
+                self._log(f"Export failed: {exc}", "error")
                 return False
             except OSError as exc:
                 self.error = str(exc)
-                self.messages.append(f"Failed to write file '{spec['output_path']}': {exc}")
+                self._log(f"Failed to write file '{spec['output_path']}': {exc}", "error")
                 return False
 
-        self.messages.append("Export completed successfully.")
+        # Reconciliation: total_features was computed up front from each
+        # layer's feature count, independent of what actually got written or
+        # skipped. On a non-cancelled run, features_written + features_skipped
+        # must equal total_features -- if it doesn't, something was silently
+        # dropped and this line would expose it.
+        self._log(
+            f"Summary: {self.features_written} of {self.total_features} feature(s) exported "
+            f"across {len(self.layer_stats)} layer(s) into {len(self.group_specs)} file(s).",
+        )
+        if self.features_skipped:
+            self._log(
+                f"{self.features_skipped} feature(s) were skipped during export -- review the warnings above.",
+                "warning",
+            )
+
+        if self.verification_failures:
+            self.error = "Row count verification failed for " + ", ".join(
+                os.path.basename(path) for path, _expected, _actual in self.verification_failures
+            ) + "."
+            self._log(
+                "Export finished writing, but output row counts didn't match expectations -- see errors above.",
+                "error",
+            )
+            return False
+
+        self._log("Export completed successfully.")
         return True
 
     def _remove_partial_output(self, output_path):
@@ -76,14 +110,15 @@ class ExportTask(QgsTask):
         except FileNotFoundError:
             return
         except OSError as exc:
-            self.messages.append(f"Unable to remove partial file '{output_path}': {exc}")
+            self._log(f"Unable to remove partial file '{output_path}': {exc}", "warning")
             return
-        self.messages.append(f"Removed partial file '{output_path}' after cancellation.")
+        self._log(f"Removed partial file '{output_path}' after cancellation.")
 
     def _write_group(self, spec):
         output_path = spec["output_path"]
         header = spec["header"]
         layers_with_fields = spec["layers_with_fields"]
+        rows_written_for_group = 0
 
         try:
             with open(output_path, "w", encoding=self.encoding, errors="replace", newline="") as handle:
@@ -95,17 +130,37 @@ class ExportTask(QgsTask):
                         self._remove_partial_output(output_path)
                         raise RuntimeError("cancelled")
 
+                    layer_name = layer_spec["layer_name"]
+                    attempted = layer_spec["feature_count"]
+                    layer_stat = {
+                        "layer_name": layer_name,
+                        "output_path": output_path,
+                        "attempted": attempted,
+                        "written": 0,
+                        "skipped": 0,
+                        "skip_reasons": {},
+                    }
+                    self.layer_stats.append(layer_stat)
+
                     if not layer_spec["crs_valid"]:
-                        self.messages.append(
-                            f"Skipping layer '{layer_spec['layer_name']}': invalid or undefined source CRS.",
+                        if attempted:
+                            layer_stat["skipped"] = attempted
+                            layer_stat["skip_reasons"]["invalid or undefined source CRS"] = attempted
+                            self.features_skipped += attempted
+                        self._log(
+                            f"Layer '{layer_name}': 0 of {attempted} feature(s) exported "
+                            f"(skipped entirely: invalid or undefined source CRS).",
+                            "warning",
                         )
+                        continue
+
+                    if attempted == 0:
+                        # Already flagged as an empty layer before the task
+                        # was started; nothing to reconcile here.
                         continue
 
                     # header_index_map maps header_name.lower() -> attribute index (or None)
                     field_lookup = layer_spec.get("header_index_map", {})
-
-                    if layer_spec["feature_count"] == 0:
-                        continue
 
                     for feature in layer_spec["feature_source"].getFeatures():
                         if self.isCanceled():
@@ -117,9 +172,12 @@ class ExportTask(QgsTask):
                             try:
                                 geometry.transform(layer_spec["transform"])
                             except Exception as exc:
-                                self.messages.append(
-                                    f"Reprojection failed for '{layer_spec['layer_name']}': {exc}",
+                                self._log(f"Reprojection failed for '{layer_name}': {exc}", "warning")
+                                layer_stat["skipped"] += 1
+                                layer_stat["skip_reasons"]["reprojection failed"] = (
+                                    layer_stat["skip_reasons"].get("reprojection failed", 0) + 1
                                 )
+                                self.features_skipped += 1
                                 continue
 
                         row = []
@@ -130,10 +188,12 @@ class ExportTask(QgsTask):
                             else:
                                 value = feature.attributes()[index] if index < len(feature.attributes()) else None
                                 row.append(self.dock_widget._normalize_value(value))
-                        row.append(layer_spec["layer_name"])
+                        row.append(layer_name)
                         row.append(geometry.asWkt(WKT_COORDINATE_PRECISION))
                         writer.writerow(row)
+                        rows_written_for_group += 1
                         self.features_written += 1
+                        layer_stat["written"] += 1
                         # Periodically flush to ensure large exports leave
                         # more data on-disk in case of a crash. Flush every 1000 rows.
                         if self.features_written % 1000 == 0:
@@ -147,10 +207,40 @@ class ExportTask(QgsTask):
                         else:
                             progress = 100
                         self.setProgress(progress)
+
+                    reasons = ", ".join(f"{count} {reason}" for reason, count in layer_stat["skip_reasons"].items())
+                    summary = f"Layer '{layer_name}': {layer_stat['written']} of {attempted} feature(s) exported"
+                    if layer_stat["skipped"]:
+                        summary += f" ({layer_stat['skipped']} skipped: {reasons})"
+                    summary += "."
+                    self._log(summary, "warning" if layer_stat["skipped"] else "info")
         except RuntimeError:
             raise
 
-        self.messages.append(f"Exported {output_path}")
+        self._log(f"Exported {output_path}")
+        self._verify_output_row_count(output_path, rows_written_for_group + 1)
+
+    def _verify_output_row_count(self, output_path, expected_rows):
+        # Re-read the file we just wrote and count its actual rows (via
+        # csv.reader so quoted embedded newlines aren't miscounted) rather
+        # than trusting the in-memory write counters alone -- this catches
+        # disk/encoding-layer problems the counters wouldn't see.
+        try:
+            with open(output_path, "r", encoding=self.encoding, errors="replace", newline="") as handle:
+                actual_rows = sum(1 for _ in csv.reader(handle, delimiter=self.delimiter))
+        except OSError as exc:
+            self._log(f"Could not verify row count for '{output_path}': {exc}", "warning")
+            return
+
+        if actual_rows != expected_rows:
+            self.verification_failures.append((output_path, expected_rows, actual_rows))
+            self._log(
+                f"'{output_path}' contains {actual_rows} row(s) but {expected_rows} were expected "
+                f"(1 header + {expected_rows - 1} feature row(s)). The file may be incomplete.",
+                "error",
+            )
+        else:
+            self._log(f"Verified '{output_path}': row count matches ({actual_rows} rows).")
 
 
 class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
@@ -427,8 +517,8 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.export_button.setEnabled(True)
         self._active_task = None
 
-        for message in task.messages:
-            self._log_message(message, "info" if message != "Export cancelled by the user." else "warning")
+        for message, level in task.messages:
+            self._log_message(message, level)
 
         if result:
             self._show_message("Export finished successfully.", "info")
