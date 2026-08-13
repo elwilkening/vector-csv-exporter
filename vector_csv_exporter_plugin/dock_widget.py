@@ -1,5 +1,6 @@
 import csv
 import os
+from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
 from qgis.core import (
@@ -35,12 +36,13 @@ WKT_COORDINATE_PRECISION = 8
 
 
 class ExportTask(QgsTask):
-    def __init__(self, description, group_specs, delimiter, encoding, dock_widget):
+    def __init__(self, description, group_specs, delimiter, encoding, dock_widget, manifest_path):
         super().__init__(description, QgsTask.CanCancel)
         self.group_specs = group_specs
         self.delimiter = delimiter
         self.encoding = encoding
         self.dock_widget = dock_widget
+        self.manifest_path = manifest_path
         self.messages = []
         self.error = None
         self.total_features = sum(
@@ -90,6 +92,8 @@ class ExportTask(QgsTask):
                 f"{self.features_skipped} feature(s) were skipped during export -- review the warnings above.",
                 "warning",
             )
+
+        self._write_manifest("VERIFICATION_FAILED" if self.verification_failures else "SUCCESS")
 
         if self.verification_failures:
             self.error = "Row count verification failed for " + ", ".join(
@@ -241,6 +245,53 @@ class ExportTask(QgsTask):
             )
         else:
             self._log(f"Verified '{output_path}': row count matches ({actual_rows} rows).")
+
+    def _write_manifest(self, status):
+        # A durable, on-disk record of exactly what was processed -- unlike
+        # the status log, this survives after the dock is closed and can be
+        # handed to someone else as evidence nothing was silently dropped.
+        try:
+            with open(self.manifest_path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle, lineterminator="\n")
+                writer.writerow([
+                    "source_layer",
+                    "output_file",
+                    "features_in_layer",
+                    "features_exported",
+                    "features_skipped",
+                    "skip_reasons",
+                ])
+                for stat in self.layer_stats:
+                    reasons = "; ".join(
+                        f"{reason}: {count}" for reason, count in stat["skip_reasons"].items()
+                    )
+                    writer.writerow([
+                        stat["layer_name"],
+                        os.path.basename(stat["output_path"]),
+                        stat["attempted"],
+                        stat["written"],
+                        stat["skipped"],
+                        reasons,
+                    ])
+                writer.writerow([])
+                writer.writerow([
+                    "TOTAL",
+                    f"{len(self.group_specs)} file(s)",
+                    self.total_features,
+                    self.features_written,
+                    self.features_skipped,
+                    "",
+                ])
+                writer.writerow([])
+                writer.writerow(["export_status", status])
+                writer.writerow(["generated_at", datetime.now().isoformat(timespec="seconds")])
+                writer.writerow(["delimiter", "Tab" if self.delimiter == "\t" else self.delimiter])
+                writer.writerow(["encoding", self.encoding])
+        except OSError as exc:
+            self._log(f"Could not write export manifest '{self.manifest_path}': {exc}", "warning")
+            return
+
+        self._log(f"Wrote export manifest '{self.manifest_path}'.")
 
 
 class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
@@ -479,6 +530,14 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 "layers_with_fields": prepared_layers,
             })
 
+        manifest_prefix = prefix[:-4] if prefix.lower().endswith(".csv") else prefix
+        existing_outputs = {spec["output_path"] for spec in group_specs}
+        manifest_path = os.path.join(output_dir, f"{manifest_prefix}_manifest.csv")
+        suffix = 2
+        while manifest_path in existing_outputs:
+            manifest_path = os.path.join(output_dir, f"{manifest_prefix}_manifest_{suffix}.csv")
+            suffix += 1
+
         self._cancel_requested = False
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -493,6 +552,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             delimiter,
             encoding,
             self,
+            manifest_path,
         )
         self._active_task.taskCompleted.connect(self._on_export_task_completed)
         self._active_task.progressChanged.connect(self._on_export_task_progress)
