@@ -196,7 +196,10 @@ class ExportTask(QgsTask):
         try:
             with open(output_path, "w", encoding=self.encoding, errors="replace", newline="") as handle:
                 writer = csv.writer(handle, lineterminator="\n", delimiter=self.delimiter)
-                writer.writerow(header)
+                # Field names come from the data source and can start with a
+                # formula trigger just like a value can; escape them at the
+                # write site only (lookup maps keep the unescaped names).
+                writer.writerow([normalize_value(name, self.escape_formulas) for name in header])
 
                 for layer_spec in layers_with_fields:
                     if self.isCanceled():
@@ -270,7 +273,9 @@ class ExportTask(QgsTask):
                             else:
                                 value = feature.attributes()[index] if index < len(feature.attributes()) else None
                                 row.append(prepare_attribute_value(value, self.escape_formulas))
-                        row.append(layer_name)
+                        # The layer name comes from the project file, not the
+                        # exporting user -- escape it like any other value.
+                        row.append(normalize_value(layer_name, self.escape_formulas))
                         row.append(geometry.asWkt(WKT_COORDINATE_PRECISION))
                         writer.writerow(row)
                         rows_written_for_group += 1
@@ -403,7 +408,7 @@ class ExportTask(QgsTask):
                         f"{reason}: {count}" for reason, count in stat["skip_reasons"].items()
                     )
                     writer.writerow([
-                        stat["layer_name"],
+                        normalize_value(stat["layer_name"], self.escape_formulas),
                         os.path.basename(stat["output_path"]),
                         stat["attempted"],
                         stat["written"],
@@ -428,6 +433,7 @@ class ExportTask(QgsTask):
                 writer.writerow(["generated_at", datetime.now().isoformat(timespec="seconds")])
                 writer.writerow(["delimiter", "Tab" if self.delimiter == "\t" else self.delimiter])
                 writer.writerow(["encoding", self.encoding])
+                writer.writerow(["formula_escaping", "on" if self.escape_formulas else "off"])
         except OSError as exc:
             self._log(f"Could not write export manifest '{self.manifest_path}': {exc}", "warning")
             return
@@ -461,6 +467,18 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.settings_layout.addWidget(self.keep_original_crs_checkbox)
         self.keep_original_crs_checkbox.toggled.connect(self._update_crs_selector_state)
         self._update_crs_selector_state(False)
+        # Prefixing an apostrophe to =/+/-/@/tab/CR-leading values protects
+        # anyone opening the CSV in a spreadsheet, but it also alters real
+        # data (phone numbers, '@handles', negative numbers stored as text),
+        # so it is a visible, optional setting. Default on = safe output.
+        self.escape_formulas_checkbox = QtWidgets.QCheckBox("Escape spreadsheet formulas")
+        self.escape_formulas_checkbox.setToolTip(
+            "Prefix values starting with =, +, -, @, tab, or carriage return with an "
+            "apostrophe so they cannot execute as formulas when the CSV is opened in a "
+            "spreadsheet. Disable for exact round-tripping of such values."
+        )
+        self.escape_formulas_checkbox.setChecked(True)
+        self.settings_layout.addWidget(self.escape_formulas_checkbox)
         self.populate_layers()
 
     def populate_layers(self):
@@ -741,6 +759,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             delimiter,
             encoding,
             manifest_path,
+            escape_formulas=self.escape_formulas_checkbox.isChecked(),
         )
         # QgsTask emits taskCompleted only when run() returns True; every
         # cancellation or failure path emits taskTerminated instead. Both must

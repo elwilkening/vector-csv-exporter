@@ -32,8 +32,14 @@ def normalize_value(value, escape_formulas=True):
     return str(value)
 
 
+# Spreadsheet formula-injection trigger prefixes (OWASP set): the classic
+# formula starters plus tab and carriage return, which Excel strips before
+# interpreting whatever follows (so "\t=cmd" executes like "=cmd").
+FORMULA_TRIGGER_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
 def _escape_for_csv(text, escape_formulas=True):
-    if escape_formulas and text.startswith(("=", "+", "-", "@")):
+    if escape_formulas and text.startswith(FORMULA_TRIGGER_PREFIXES):
         return f"'{text}"
     return text
 

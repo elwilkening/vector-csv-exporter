@@ -14,6 +14,10 @@ def test_strings_starting_with_formula_characters_are_escaped():
     assert normalize_value("+SUM(A1:A2)") == "'+SUM(A1:A2)"
     assert normalize_value("-5") == "'-5"
     assert normalize_value("@cmd") == "'@cmd"
+    # Excel strips a leading tab/CR and then interprets what follows, so
+    # these are formula triggers too (OWASP CSV-injection set).
+    assert normalize_value("\t=2+5") == "'\t=2+5"
+    assert normalize_value("\r=cmd") == "'\r=cmd"
 
 
 def test_non_string_values_are_left_as_strings_without_escaping():
