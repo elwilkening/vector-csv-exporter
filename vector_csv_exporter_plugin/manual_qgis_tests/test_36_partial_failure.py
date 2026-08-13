@@ -13,7 +13,7 @@ start_qgis_gui()
 from qgis.core import QgsVectorLayerFeatureSource  # noqa: E402
 
 from vector_csv_exporter_plugin.dock_widget import ExportTask  # noqa: E402
-from vector_csv_exporter_plugin.export_utils import build_group_header, normalize_value  # noqa: E402
+from vector_csv_exporter_plugin.export_utils import build_group_header  # noqa: E402
 
 
 class FailingFeatureSource:
@@ -56,14 +56,6 @@ def build_group_spec(layer, output_path, feature_source=None):
     }
 
 
-class FakeDockWidget:
-    def _normalize_value(self, value):
-        from qgis.core import NULL
-        if value == NULL:
-            value = None
-        return normalize_value(value)
-
-
 out_dir = tempfile.mkdtemp(prefix="partial_failure_test_")
 manifest_path = os.path.join(out_dir, "manifest.csv")
 
@@ -82,7 +74,7 @@ group_specs = [
     ),
 ]
 
-task = ExportTask("test", group_specs, ",", "utf-8", FakeDockWidget(), manifest_path)
+task = ExportTask("test", group_specs, ",", "utf-8", manifest_path)
 result = task.run()
 
 print("--- task.messages ---")

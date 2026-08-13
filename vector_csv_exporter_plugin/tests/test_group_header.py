@@ -35,6 +35,22 @@ def test_source_layer_field_renamed():
     assert header[-1].lower() == "wkt"
 
 
+def test_geometry_named_field_is_renamed_not_dropped():
+    # Regression: a real attribute field literally named 'geometry' used to
+    # be silently dropped from the export (no column, no log). It must be
+    # preserved via rename like the other reserved names.
+    layers = [("layer", [(0, "id"), (1, "Geometry"), (2, "value")])]
+    header, maps, canon = build_group_header(layers)
+
+    layer_map = canon[0]
+    assert "geometry" in layer_map, "field must be registered, not discarded"
+    renamed = layer_map["geometry"]
+    assert renamed.lower() != "geometry"
+    assert any(h == renamed for h in header[:-2]), "renamed column must be in the header"
+    # index map must point the renamed column back at the true attribute index
+    assert maps[0][renamed.lower()] == 1
+
+
 def test_data_header_signature_ignores_reserved():
     sig1 = data_header_signature(["Name", "WKT"])
     sig2 = data_header_signature(["Name"])  # WKT is reserved and should be ignored in signature

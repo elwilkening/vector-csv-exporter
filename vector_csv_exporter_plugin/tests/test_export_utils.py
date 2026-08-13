@@ -26,6 +26,27 @@ def test_bytes_are_decoded_and_escaped_when_needed():
     assert normalize_value(b"=cmd") == "'=cmd"
 
 
+def test_booleans_serialize_as_integers_matching_csvt():
+    # The .csvt sidecar declares Bool columns as Integer, so the cell
+    # values must be 1/0 -- "True" would parse back as 0 on re-import.
+    assert normalize_value(True) == "1"
+    assert normalize_value(False) == "0"
+
+
+def test_dates_serialize_as_iso_matching_csvt():
+    import datetime
+
+    assert normalize_value(datetime.date(2024, 5, 1)) == "2024-05-01"
+    assert normalize_value(datetime.datetime(2024, 5, 1, 13, 30, 5)) == "2024-05-01 13:30:05"
+    assert normalize_value(datetime.time(13, 30, 5)) == "13:30:05"
+
+
+def test_escaping_can_be_disabled():
+    assert normalize_value("=1+1", escape_formulas=False) == "=1+1"
+    assert normalize_value("-5", escape_formulas=False) == "-5"
+    assert normalize_value(b"=cmd", escape_formulas=False) == "=cmd"
+
+
 def test_sanitize_prefix_replaces_invalid_characters():
     assert sanitize_prefix("My Layer #1") == "My_Layer_1"
     assert sanitize_prefix("   ") == "export"

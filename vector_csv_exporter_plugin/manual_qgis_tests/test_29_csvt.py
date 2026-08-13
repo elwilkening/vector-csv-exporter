@@ -14,7 +14,7 @@ start_qgis_gui()
 from qgis.core import QgsVectorLayerFeatureSource  # noqa: E402
 
 from vector_csv_exporter_plugin.dock_widget import ExportTask, VectorCsvExporterDockWidget  # noqa: E402
-from vector_csv_exporter_plugin.export_utils import build_group_header, normalize_value  # noqa: E402
+from vector_csv_exporter_plugin.export_utils import build_group_header  # noqa: E402
 
 layer = load_csv_layer("mixed_types.csv", "mixed_types")
 
@@ -50,15 +50,7 @@ group_spec = {
 }
 
 
-class FakeDockWidget:
-    def _normalize_value(self, value):
-        from qgis.core import NULL
-        if value == NULL:
-            value = None
-        return normalize_value(value)
-
-
-task = ExportTask("test", [group_spec], ",", "utf-8", FakeDockWidget(), manifest_path)
+task = ExportTask("test", [group_spec], ",", "utf-8", manifest_path)
 result = task.run()
 
 print("\n--- task.messages ---")

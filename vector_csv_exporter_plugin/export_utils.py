@@ -1,3 +1,4 @@
+import datetime
 import re
 
 # Reserved column names appended by the plugin or treated specially.
@@ -5,20 +6,34 @@ import re
 RESERVED_NAMES = {"geometry", "wkt", "source_layer"}
 
 
-def normalize_value(value):
+def normalize_value(value, escape_formulas=True):
     if value is None:
         return ""
+    # bool must precede the generic fallback: str(True) would write "True"
+    # into a column whose .csvt sidecar declares Integer, so GDAL would
+    # parse every True back as 0 on re-import.
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    # datetime must precede date (datetime subclasses date). The formats
+    # match what GDAL's CSV driver expects for csvt Date/Time/DateTime
+    # columns, so re-imports round-trip.
+    if isinstance(value, datetime.datetime):
+        return value.isoformat(sep=" ", timespec="seconds")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, datetime.time):
+        return value.isoformat(timespec="seconds")
     if isinstance(value, bytes):
         decoded = value.decode("utf-8", errors="replace")
-        return _escape_for_csv(decoded)
+        return _escape_for_csv(decoded, escape_formulas)
     if isinstance(value, str):
         text = value.encode("utf-8", errors="replace").decode("utf-8")
-        return _escape_for_csv(text)
+        return _escape_for_csv(text, escape_formulas)
     return str(value)
 
 
-def _escape_for_csv(text):
-    if text.startswith(("=", "+", "-", "@")):
+def _escape_for_csv(text, escape_formulas=True):
+    if escape_formulas and text.startswith(("=", "+", "-", "@")):
         return f"'{text}"
     return text
 
@@ -155,8 +170,6 @@ def build_group_header(layers_with_fields):
                 continue
             normalized = name.strip()
             n_lower = normalized.lower()
-            if n_lower == "geometry":
-                continue
             if n_lower in used_map:
                 # reuse existing canonical name
                 layer_map[n_lower] = used_map[n_lower]

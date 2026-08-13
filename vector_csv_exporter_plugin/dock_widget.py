@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QByteArray, QDate, QDateTime, QTime, QVariant
 from qgis.core import (
     NULL,
     Qgis,
@@ -56,14 +56,36 @@ def _csvt_type_for_field(field):
     return _CSVT_TYPE_MAP.get(field.type(), "String")
 
 
+def prepare_attribute_value(value, escape_formulas=True):
+    """Convert a raw PyQGIS attribute to its CSV cell string.
+
+    Handles the QGIS/Qt-specific representations (the NULL sentinel, which is
+    not Python's None; QDate/QDateTime/QTime, whose str() is a PyQt repr like
+    'PyQt5.QtCore.QDate(2024, 5, 1)'; QByteArray) by converting them to plain
+    Python values, then delegates to the QGIS-independent normalize_value().
+    Module-level on purpose: ExportTask calls this from its background thread,
+    and it must not touch any widget."""
+    if value == NULL:
+        return normalize_value(None)
+    if isinstance(value, QDateTime):
+        value = None if value.isNull() else value.toPyDateTime()
+    elif isinstance(value, QDate):
+        value = None if value.isNull() else value.toPyDate()
+    elif isinstance(value, QTime):
+        value = None if value.isNull() else value.toPyTime()
+    elif isinstance(value, QByteArray):
+        value = bytes(value)
+    return normalize_value(value, escape_formulas)
+
+
 class ExportTask(QgsTask):
-    def __init__(self, description, group_specs, delimiter, encoding, dock_widget, manifest_path):
+    def __init__(self, description, group_specs, delimiter, encoding, manifest_path, escape_formulas=True):
         super().__init__(description, QgsTask.CanCancel)
         self.group_specs = group_specs
         self.delimiter = delimiter
         self.encoding = encoding
-        self.dock_widget = dock_widget
         self.manifest_path = manifest_path
+        self.escape_formulas = escape_formulas
         self.messages = []
         self.error = None
         self.total_features = sum(
@@ -247,7 +269,7 @@ class ExportTask(QgsTask):
                                 row.append("")
                             else:
                                 value = feature.attributes()[index] if index < len(feature.attributes()) else None
-                                row.append(self.dock_widget._normalize_value(value))
+                                row.append(prepare_attribute_value(value, self.escape_formulas))
                         row.append(layer_name)
                         row.append(geometry.asWkt(WKT_COORDINATE_PRECISION))
                         writer.writerow(row)
@@ -718,7 +740,6 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             group_specs,
             delimiter,
             encoding,
-            self,
             manifest_path,
         )
         # QgsTask emits taskCompleted only when run() returns True; every
@@ -761,14 +782,6 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 self._show_message(task.error, "error")
             else:
                 self._show_message("Export was cancelled or failed.", "warning")
-
-    def _normalize_value(self, value):
-        # PyQGIS represents a null attribute with its own NULL sentinel, which
-        # is not Python's None, so it must be converted here before reaching
-        # the QGIS-independent normalize_value() helper.
-        if value == NULL:
-            value = None
-        return normalize_value(value)
 
     def _get_selected_delimiter(self):
         selected = self.delimiter_combo.currentText()
