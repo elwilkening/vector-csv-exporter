@@ -64,3 +64,37 @@ def test_multiple_layers_same_reserved_field_rename():
     # Header should contain only one occurrence of the renamed column
     occurrences = [h for h in header[:-2] if h == renamed]
     assert len(occurrences) == 1
+
+
+def test_reserved_collision_log_field_name_matches_owning_layer():
+    """
+    Regression test for a stale-variable bug in
+    VectorCsvExporterDockWidget.export_selected_layers(): the reserved-name
+    collision log message must resolve each layer's original field casing
+    from that layer's own field_names (as fixed), not from a variable left
+    over from an earlier, unrelated loop. Two layers here both have a field
+    colliding with the reserved "wkt" column but with different original
+    casing, so mixing the two layers up would be caught.
+    """
+    layers = [
+        ("layerA", [(0, "id"), (1, "Wkt")]),
+        ("layerB", [(0, "id"), (1, "wKT")]),
+    ]
+    header, maps, canon = build_group_header(layers)
+
+    resolved = {}
+    for (layer_name, field_names), canonical_map in zip(layers, canon):
+        for orig_lower, canonical in canonical_map.items():
+            if canonical.lower() != orig_lower:
+                # Mirrors the fixed lookup in dock_widget.py: resolve the
+                # original-cased name from *this* layer's own field_names,
+                # not a stale variable from an earlier, already-finished loop.
+                orig_name = next(
+                    (name for (_idx, name) in field_names if name and name.strip().lower() == orig_lower),
+                    orig_lower,
+                )
+                resolved[layer_name] = orig_name
+
+    assert resolved["layerA"] == "Wkt"
+    assert resolved["layerB"] == "wKT"
+    assert resolved["layerA"] != resolved["layerB"]

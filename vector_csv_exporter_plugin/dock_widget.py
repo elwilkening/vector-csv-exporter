@@ -27,6 +27,11 @@ from .export_utils import (
     dedupe_field_names,
 )
 
+# Decimal degrees of precision for exported WKT coordinates. 8 decimal
+# degrees is well below sub-millimeter precision at the equator, so this
+# trims floating-point noise from CRS reprojection without losing accuracy.
+WKT_COORDINATE_PRECISION = 8
+
 
 class ExportTask(QgsTask):
     def __init__(self, description, group_specs, delimiter, encoding, dock_widget):
@@ -125,7 +130,7 @@ class ExportTask(QgsTask):
                                 value = feature.attributes()[index] if index < len(feature.attributes()) else None
                                 row.append(self.dock_widget._normalize_value(value))
                         row.append(layer_spec["layer_name"])
-                        row.append(geometry.asWkt())
+                        row.append(geometry.asWkt(WKT_COORDINATE_PRECISION))
                         writer.writerow(row)
                         self.features_written += 1
                         # Periodically flush to ensure large exports leave
@@ -371,9 +376,10 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 # Log any renamed fields for this layer
                 for orig_lower, canonical in canonical_map.items():
                     if canonical.lower() != orig_lower:
-                        # field_names is a list of (orig_index, name) pairs; find the
-                        # original-cased name from the layer's full field list where possible.
-                        orig_name = next((n for n in all_field_names if n.strip().lower() == orig_lower), orig_lower)
+                        # field_names is this layer's list of (orig_index, name) pairs; find the
+                        # original-cased name from it rather than the stale, last-iteration
+                        # all_field_names from the earlier per-layer loop.
+                        orig_name = next((name for (_idx, name) in field_names if name and name.strip().lower() == orig_lower), orig_lower)
                         self._log_message(f"Field '{orig_name}' from layer '{layer.name()}' was renamed to '{canonical}' to avoid colliding with reserved column names.", "warning")
 
             group_specs.append({
