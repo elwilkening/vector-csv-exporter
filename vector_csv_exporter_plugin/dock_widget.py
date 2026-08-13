@@ -705,6 +705,11 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             return QgsCoordinateReferenceSystem.fromEpsgId(4326)
 
     def _build_transform(self, source_crs, destination_crs):
+        # QgsCoordinateTransform's constructor signature has changed across
+        # QGIS versions: newer APIs want an explicit QgsCoordinateTransformContext
+        # (project.transformContext()), older ones take the QgsProject directly,
+        # and the oldest take neither. Try each in turn so this plugin keeps
+        # working across the QGIS versions it might be installed on.
         project = QgsProject.instance()
         if hasattr(project, "transformContext"):
             try:
