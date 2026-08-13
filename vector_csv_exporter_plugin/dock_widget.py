@@ -55,6 +55,11 @@ class ExportTask(QgsTask):
         # single running total. Also the basis for a future export manifest.
         self.layer_stats = []
         self.verification_failures = []
+        # Stronger than count-based reconciliation: records layers where the
+        # set of feature IDs actually processed doesn't match the layer's
+        # feature IDs at export start, catching cases where counts could
+        # coincidentally match despite the wrong features being processed.
+        self.id_verification_failures = []
 
     def _log(self, text, level="info"):
         self.messages.append((text, level))
@@ -93,14 +98,31 @@ class ExportTask(QgsTask):
                 "warning",
             )
 
-        self._write_manifest("VERIFICATION_FAILED" if self.verification_failures else "SUCCESS")
-
+        status = "SUCCESS"
         if self.verification_failures:
-            self.error = "Row count verification failed for " + ", ".join(
-                os.path.basename(path) for path, _expected, _actual in self.verification_failures
-            ) + "."
+            status = "ROW_COUNT_MISMATCH"
+        if self.id_verification_failures:
+            status = status + "+FEATURE_ID_MISMATCH" if status != "SUCCESS" else "FEATURE_ID_MISMATCH"
+        self._write_manifest(status)
+
+        if self.verification_failures or self.id_verification_failures:
+            error_parts = []
+            if self.verification_failures:
+                error_parts.append(
+                    "row count verification failed for "
+                    + ", ".join(os.path.basename(path) for path, _expected, _actual in self.verification_failures)
+                )
+            if self.id_verification_failures:
+                error_parts.append(
+                    "feature ID verification failed for "
+                    + ", ".join(
+                        f"'{name}' ({missing} feature(s) never processed)"
+                        for name, missing in self.id_verification_failures
+                    )
+                )
+            self.error = "; ".join(error_parts) + "."
             self._log(
-                "Export finished writing, but output row counts didn't match expectations -- see errors above.",
+                "Export finished writing, but verification found problems -- see errors above.",
                 "error",
             )
             return False
@@ -143,6 +165,10 @@ class ExportTask(QgsTask):
                         "written": 0,
                         "skipped": 0,
                         "skip_reasons": {},
+                        # None means feature-ID verification wasn't performed for this
+                        # layer (e.g. it was skipped entirely, or ID snapshotting failed).
+                        "missing_feature_ids": None,
+                        "unexpected_feature_ids": None,
                     }
                     self.layer_stats.append(layer_stat)
 
@@ -165,11 +191,15 @@ class ExportTask(QgsTask):
 
                     # header_index_map maps header_name.lower() -> attribute index (or None)
                     field_lookup = layer_spec.get("header_index_map", {})
+                    written_ids = set()
+                    skipped_ids = set()
 
                     for feature in layer_spec["feature_source"].getFeatures():
                         if self.isCanceled():
                             self._remove_partial_output(output_path)
                             raise RuntimeError("cancelled")
+
+                        feature_id = feature.id()
 
                         geometry = QgsGeometry(feature.geometry())
                         if layer_spec["transform"] is not None:
@@ -182,6 +212,7 @@ class ExportTask(QgsTask):
                                     layer_stat["skip_reasons"].get("reprojection failed", 0) + 1
                                 )
                                 self.features_skipped += 1
+                                skipped_ids.add(feature_id)
                                 continue
 
                         row = []
@@ -198,6 +229,7 @@ class ExportTask(QgsTask):
                         rows_written_for_group += 1
                         self.features_written += 1
                         layer_stat["written"] += 1
+                        written_ids.add(feature_id)
                         # Periodically flush to ensure large exports leave
                         # more data on-disk in case of a crash. Flush every 1000 rows.
                         if self.features_written % 1000 == 0:
@@ -218,6 +250,8 @@ class ExportTask(QgsTask):
                         summary += f" ({layer_stat['skipped']} skipped: {reasons})"
                     summary += "."
                     self._log(summary, "warning" if layer_stat["skipped"] else "info")
+
+                    self._verify_feature_ids(layer_spec, layer_stat, written_ids, skipped_ids)
         except RuntimeError:
             raise
 
@@ -246,6 +280,41 @@ class ExportTask(QgsTask):
         else:
             self._log(f"Verified '{output_path}': row count matches ({actual_rows} rows).")
 
+    def _verify_feature_ids(self, layer_spec, layer_stat, written_ids, skipped_ids):
+        # Counts can coincidentally match even if the wrong features were
+        # processed (e.g. one feature double-counted while another was
+        # missed). Comparing actual feature-ID sets against the layer's IDs
+        # at export start catches that a bare count comparison would not.
+        expected_ids = layer_spec.get("expected_feature_ids")
+        if expected_ids is None:
+            return
+
+        layer_name = layer_stat["layer_name"]
+        processed_ids = written_ids | skipped_ids
+        missing_ids = expected_ids - processed_ids
+        unexpected_ids = processed_ids - expected_ids
+        layer_stat["missing_feature_ids"] = len(missing_ids)
+        layer_stat["unexpected_feature_ids"] = len(unexpected_ids)
+
+        if missing_ids:
+            sample = ", ".join(str(fid) for fid in sorted(missing_ids)[:5])
+            self._log(
+                f"Layer '{layer_name}': {len(missing_ids)} feature ID(s) from the source layer were "
+                f"never processed during export (e.g. {sample}). Count-based tracking alone would not "
+                f"have caught this.",
+                "error",
+            )
+            self.id_verification_failures.append((layer_name, len(missing_ids)))
+
+        if unexpected_ids:
+            sample = ", ".join(str(fid) for fid in sorted(unexpected_ids)[:5])
+            self._log(
+                f"Layer '{layer_name}': {len(unexpected_ids)} feature ID(s) were processed that weren't "
+                f"in the layer's feature-ID snapshot taken before export (e.g. {sample}) -- the layer may "
+                f"have been edited while the export was running.",
+                "warning",
+            )
+
     def _write_manifest(self, status):
         # A durable, on-disk record of exactly what was processed -- unlike
         # the status log, this survives after the dock is closed and can be
@@ -260,6 +329,8 @@ class ExportTask(QgsTask):
                     "features_exported",
                     "features_skipped",
                     "skip_reasons",
+                    "missing_feature_ids",
+                    "unexpected_feature_ids",
                 ])
                 for stat in self.layer_stats:
                     reasons = "; ".join(
@@ -272,6 +343,8 @@ class ExportTask(QgsTask):
                         stat["written"],
                         stat["skipped"],
                         reasons,
+                        stat["missing_feature_ids"] if stat["missing_feature_ids"] is not None else "not checked",
+                        stat["unexpected_feature_ids"] if stat["unexpected_feature_ids"] is not None else "not checked",
                     ])
                 writer.writerow([])
                 writer.writerow([
@@ -281,6 +354,8 @@ class ExportTask(QgsTask):
                     self.features_written,
                     self.features_skipped,
                     "",
+                    sum(s["missing_feature_ids"] or 0 for s in self.layer_stats),
+                    sum(s["unexpected_feature_ids"] or 0 for s in self.layer_stats),
                 ])
                 writer.writerow([])
                 writer.writerow(["export_status", status])
@@ -504,6 +579,18 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 transform = None
                 if not self.keep_original_crs_checkbox.isChecked():
                     transform = self._build_transform(layer.crs(), self._get_target_crs())
+                # Snapshot the layer's feature IDs here on the main thread
+                # (QgsVectorLayer isn't safe to query from the background
+                # task's thread) so the export can later verify it actually
+                # processed every one of them, not just the right count.
+                try:
+                    expected_feature_ids = set(layer.allFeatureIds())
+                except Exception as exc:
+                    expected_feature_ids = None
+                    self._log_message(
+                        f"Could not read feature IDs for layer '{layer.name()}' ahead of export: {exc}",
+                        "warning",
+                    )
                 layer_spec = {
                     "feature_source": QgsVectorLayerFeatureSource(layer),
                     "layer_name": layer.name(),
@@ -513,6 +600,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                     "transform": transform,
                     "header_index_map": index_map,
                     "canonical_map": canonical_map,
+                    "expected_feature_ids": expected_feature_ids,
                 }
                 prepared_layers.append(layer_spec)
                 # Log any renamed fields for this layer
