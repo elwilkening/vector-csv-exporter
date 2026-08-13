@@ -721,7 +721,12 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             self,
             manifest_path,
         )
+        # QgsTask emits taskCompleted only when run() returns True; every
+        # cancellation or failure path emits taskTerminated instead. Both must
+        # be connected or an unsuccessful export leaves the progress bar up,
+        # the export button disabled, and the task's log messages unshown.
         self._active_task.taskCompleted.connect(self._on_export_task_completed)
+        self._active_task.taskTerminated.connect(self._on_export_task_terminated)
         self._active_task.progressChanged.connect(self._on_export_task_progress)
         QgsApplication.taskManager().addTask(self._active_task)
 
@@ -732,6 +737,9 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
     def _on_export_task_progress(self, progress):
         self.progress_bar.setValue(int(progress))
+
+    def _on_export_task_terminated(self):
+        self._on_export_task_completed(result=False)
 
     def _on_export_task_completed(self, result=True):
         task = self.sender()
