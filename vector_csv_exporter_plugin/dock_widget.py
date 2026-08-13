@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
+from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
     NULL,
     Qgis,
@@ -33,6 +34,26 @@ from .export_utils import (
 # degrees is well below sub-millimeter precision at the equator, so this
 # trims floating-point noise from CRS reprojection without losing accuracy.
 WKT_COORDINATE_PRECISION = 8
+
+# Maps QGIS field types to the type names GDAL/OGR's CSV driver recognizes in
+# a .csvt sidecar file, so a re-imported CSV regains its original field types
+# instead of every column becoming plain text.
+_CSVT_TYPE_MAP = {
+    QVariant.Int: "Integer",
+    QVariant.UInt: "Integer",
+    QVariant.LongLong: "Integer64",
+    QVariant.ULongLong: "Integer64",
+    QVariant.Double: "Real",
+    QVariant.Bool: "Integer",
+    QVariant.Date: "Date",
+    QVariant.Time: "Time",
+    QVariant.DateTime: "DateTime",
+    QVariant.String: "String",
+}
+
+
+def _csvt_type_for_field(field):
+    return _CSVT_TYPE_MAP.get(field.type(), "String")
 
 
 class ExportTask(QgsTask):
@@ -261,6 +282,7 @@ class ExportTask(QgsTask):
 
         self._log(f"Exported {output_path}")
         self._verify_output_row_count(output_path, rows_written_for_group + 1)
+        self._write_csvt(output_path, spec.get("column_types"))
 
     def _verify_output_row_count(self, output_path, expected_rows):
         # Re-read the file we just wrote and count its actual rows (via
@@ -283,6 +305,24 @@ class ExportTask(QgsTask):
             )
         else:
             self._log(f"Verified '{output_path}': row count matches ({actual_rows} rows).")
+
+    def _write_csvt(self, output_path, column_types):
+        # A .csvt sidecar (GDAL/OGR's CSV-driver convention: same basename,
+        # always comma-separated regardless of the main file's delimiter)
+        # lets a re-imported CSV regain its original field types instead of
+        # every column becoming plain text. Best-effort: failure here
+        # shouldn't fail an otherwise-successful export.
+        if not column_types:
+            return
+        csvt_path = os.path.splitext(output_path)[0] + ".csvt"
+        try:
+            with open(csvt_path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle, lineterminator="\n", quoting=csv.QUOTE_ALL)
+                writer.writerow(column_types)
+        except OSError as exc:
+            self._log(f"Could not write field-type sidecar '{csvt_path}': {exc}", "warning")
+            return
+        self._log(f"Wrote field-type sidecar '{csvt_path}'.")
 
     def _verify_feature_ids(self, layer_spec, layer_stat, written_ids, skipped_ids):
         # Counts can coincidentally match even if the wrong features were
@@ -572,16 +612,20 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
         group_count = len(grouped_layers)
         group_specs = []
+        unreachable_transform_layers = []
         for index, (_, layers_with_fields) in enumerate(grouped_layers.items(), start=1):
             # Build a collision-safe header and per-layer index maps
             header, per_layer_index_maps, per_layer_canonical_maps = build_group_header(layers_with_fields)
             output_name = self._build_output_name(prefix, group_count, index)
             output_path = os.path.join(output_dir, output_name)
+            column_types = self._build_column_types(header, layers_with_fields, per_layer_index_maps)
             prepared_layers = []
             for (layer, field_names), index_map, canonical_map in zip(layers_with_fields, per_layer_index_maps, per_layer_canonical_maps):
                 transform = None
                 if not self.keep_original_crs_checkbox.isChecked():
                     transform = self._build_transform(layer.crs(), self._get_target_crs())
+                    if not self._crs_transform_is_reachable(layer, transform):
+                        unreachable_transform_layers.append(layer.name())
                 # Snapshot the layer's feature IDs here on the main thread
                 # (QgsVectorLayer isn't safe to query from the background
                 # task's thread) so the export can later verify it actually
@@ -619,7 +663,24 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 "output_path": output_path,
                 "header": header,
                 "layers_with_fields": prepared_layers,
+                "column_types": column_types,
             })
+
+        if unreachable_transform_layers:
+            names = "\n".join(sorted(set(unreachable_transform_layers)))
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Some layers may not reproject",
+                "A test reprojection to the target CRS failed for the following layer(s):\n\n"
+                f"{names}\n\n"
+                "Affected features will be skipped during export (reported per-feature in "
+                "the log and manifest, not silently dropped). Continue anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                self._log_message("Export cancelled by the user due to CRS reprojection concerns.", "info")
+                return
 
         manifest_prefix = prefix[:-4] if prefix.lower().endswith(".csv") else prefix
         existing_outputs = {spec["output_path"] for spec in group_specs}
@@ -628,6 +689,22 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         while manifest_path in existing_outputs:
             manifest_path = os.path.join(output_dir, f"{manifest_prefix}_manifest_{suffix}.csv")
             suffix += 1
+
+        prospective_outputs = list(existing_outputs) + [manifest_path]
+        prospective_outputs += [os.path.splitext(p)[0] + ".csvt" for p in existing_outputs]
+        already_existing = sorted(os.path.basename(p) for p in prospective_outputs if os.path.exists(p))
+        if already_existing:
+            reply = QtWidgets.QMessageBox.question(
+                self,
+                "Overwrite existing files?",
+                "The following file(s) already exist in the output directory and will be "
+                "overwritten:\n\n" + "\n".join(already_existing) + "\n\nContinue?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                self._log_message("Export cancelled by the user (existing files not overwritten).", "info")
+                return
 
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -721,6 +798,40 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             return QgsCoordinateTransform(source_crs, destination_crs, project)
         except TypeError:
             return QgsCoordinateTransform(source_crs, destination_crs)
+
+    def _crs_transform_is_reachable(self, layer, transform):
+        # Test-transform the layer's extent center up front rather than only
+        # discovering a bad CRS pairing feature-by-feature deep into a
+        # potentially long export. A layer with no features has no extent to
+        # test, so it's treated as reachable (nothing to reproject anyway).
+        if transform is None:
+            return True
+        extent = layer.extent()
+        if extent.isEmpty():
+            return True
+        try:
+            transform.transform(extent.center())
+        except QgsCsException:
+            return False
+        return True
+
+    def _build_column_types(self, header, layers_with_fields, per_layer_index_maps):
+        # Determine a CSVT field type for each real attribute column by
+        # looking up the QgsField type from whichever layer's field first
+        # established that canonical header column -- same precedence
+        # build_group_header() already uses for the column name itself.
+        column_types = []
+        for column in header[:-2]:
+            column_lower = column.lower()
+            field_type = "String"
+            for (layer, _field_names), index_map in zip(layers_with_fields, per_layer_index_maps):
+                true_index = index_map.get(column_lower)
+                if true_index is not None:
+                    field_type = _csvt_type_for_field(layer.fields().at(true_index))
+                    break
+            column_types.append(field_type)
+        column_types.extend(["String", "String"])  # SOURCE_LAYER, WKT
+        return column_types
 
     def _sanitize_prefix(self, prefix):
         return sanitize_prefix(prefix)
