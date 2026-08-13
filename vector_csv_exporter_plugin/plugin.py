@@ -39,6 +39,9 @@ class VectorCsvExporterPlugin(object):
             self.action.deleteLater()
             self.action = None
         if self.dock_widget is not None:
+            # Cancel any running export first, or the background task keeps
+            # writing files after the dock (and its signal connections) die.
+            self.dock_widget.shutdown()
             self.iface.removeDockWidget(self.dock_widget)
             self.dock_widget.deleteLater()
             self.dock_widget = None

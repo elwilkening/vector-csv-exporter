@@ -542,15 +542,25 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.export_button.clicked.connect(self.export_selected_layers)
         self.refresh_button.clicked.connect(self.populate_layers)
         self.cancel_button.clicked.connect(self._cancel_export)
-        self.layer_list_widget.itemClicked.connect(self._show_selected_layer_fields)
-        self.layer_list_widget.itemChanged.connect(self._on_layer_item_changed)
+        # The field panel follows the current (highlighted) row only.
+        # Deliberately NOT itemChanged: check-state toggles -- including the
+        # programmatic ones Select All performs -- must not retarget the
+        # panel, or _active_layer_id desyncs from what the user is viewing
+        # and their field edits get saved against the wrong layer.
+        self.layer_list_widget.currentItemChanged.connect(self._on_current_layer_changed)
+        self.layer_list_widget.itemChanged.connect(self._sync_select_all_checkbox)
         self.field_list_widget.itemChanged.connect(self._on_field_item_changed)
         self.progress_bar.setVisible(False)
         self.cancel_button.setVisible(False)
         self._active_task = None
         self._settings = QtCore.QSettings("QGIS", "VectorCsvExporter")
+        # Maps layer id -> the field names the user explicitly chose. A layer
+        # ABSENT from this dict means "all fields", resolved freshly at
+        # display and export time -- so fields added to a layer mid-session
+        # are included unless the user has customized that layer's list.
         self._layer_field_selection = {}
         self._active_layer_id = None
+        self._populating_fields = False
         self._crs_selector = QgsProjectionSelectionWidget(self)
         self._crs_selector.setCrs(self._get_wgs84_crs())
         self.settings_layout.addWidget(self._crs_selector)
@@ -573,23 +583,42 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self.populate_layers()
 
     def populate_layers(self):
+        # Preserve the user's curation across refreshes: remember check
+        # states by layer id, and keep explicit field selections for layers
+        # that still exist. Previously this method reset everything, so
+        # clicking Refresh (or the toolbar action, which repopulates) wiped
+        # all layer/field choices with no warning.
+        previous_check_states = {}
+        for index in range(self.layer_list_widget.count()):
+            item = self.layer_list_widget.item(index)
+            previous_check_states[item.data(QtCore.Qt.UserRole)] = item.checkState()
+
         self.layer_list_widget.clear()
         self.field_list_widget.clear()
-        self._layer_field_selection = {}
         project = QgsProject.instance()
+        current_layer_ids = set()
         warning_messages = []
 
         for layer in project.mapLayers().values():
             if layer.type() == QgsMapLayer.VectorLayer:
+                current_layer_ids.add(layer.id())
                 item = QtWidgets.QListWidgetItem(layer.name())
                 item.setData(QtCore.Qt.UserRole, layer.id())
                 item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                item.setCheckState(QtCore.Qt.Checked)
+                item.setCheckState(previous_check_states.get(layer.id(), QtCore.Qt.Checked))
                 self.layer_list_widget.addItem(item)
-                field_names = [field.name().strip() for field in layer.fields()]
-                self._layer_field_selection[layer.id()] = set(field_names)
             else:
                 warning_messages.append(f"Skipped non-vector layer: {layer.name()}")
+
+        # Drop field selections for layers no longer in the project; keep the
+        # rest. Layers are deliberately NOT re-seeded -- absence means "all
+        # fields at export time".
+        self._layer_field_selection = {
+            layer_id: fields
+            for layer_id, fields in self._layer_field_selection.items()
+            if layer_id in current_layer_ids
+        }
+        self._sync_select_all_checkbox()
 
         if warning_messages:
             self._log_message("\n".join(warning_messages), "warning")
@@ -603,16 +632,22 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             item = self.layer_list_widget.item(index)
             item.setCheckState(checked_state)
 
-    def _on_layer_item_changed(self, item):
-        if item is None:
-            return
-        layer_id = item.data(QtCore.Qt.UserRole)
-        if not layer_id:
-            return
-        self._show_selected_layer_fields(item)
+    def _sync_select_all_checkbox(self, _item=None):
+        # Keep the Select All box reflecting reality (all rows checked or
+        # not) without re-triggering _set_all_checked.
+        count = self.layer_list_widget.count()
+        all_checked = count > 0 and all(
+            self.layer_list_widget.item(i).checkState() == QtCore.Qt.Checked for i in range(count)
+        )
+        self.select_all_checkbox.blockSignals(True)
+        self.select_all_checkbox.setChecked(all_checked)
+        self.select_all_checkbox.blockSignals(False)
+
+    def _on_current_layer_changed(self, current, _previous=None):
+        self._show_selected_layer_fields(current)
 
     def _on_field_item_changed(self, item):
-        if item is None:
+        if item is None or self._populating_fields:
             return
         self._save_selected_fields(self._active_layer_id)
 
@@ -629,12 +664,19 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         self._active_layer_id = layer.id()
         field_names = [field.name().strip() for field in layer.fields()]
         checked_fields = self._layer_field_selection.get(layer.id(), set(field_names))
-        for field_name in field_names:
-            field_item = QtWidgets.QListWidgetItem(field_name)
-            field_item.setData(QtCore.Qt.UserRole, field_name)
-            field_item.setFlags(field_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            field_item.setCheckState(QtCore.Qt.Checked if field_name in checked_fields else QtCore.Qt.Unchecked)
-            self.field_list_widget.addItem(field_item)
+        # Guard against the itemChanged signals the setCheckState calls below
+        # emit: without it, a half-built list would be saved as the layer's
+        # explicit field selection mid-rebuild.
+        self._populating_fields = True
+        try:
+            for field_name in field_names:
+                field_item = QtWidgets.QListWidgetItem(field_name)
+                field_item.setData(QtCore.Qt.UserRole, field_name)
+                field_item.setFlags(field_item.flags() | QtCore.Qt.ItemIsUserCheckable)
+                field_item.setCheckState(QtCore.Qt.Checked if field_name in checked_fields else QtCore.Qt.Unchecked)
+                self.field_list_widget.addItem(field_item)
+        finally:
+            self._populating_fields = False
         self.field_list_widget.setVisible(True)
 
     def _save_selected_fields(self, layer_id):
@@ -761,19 +803,37 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
                 # (QgsVectorLayer isn't safe to query from the background
                 # task's thread) so the export can later verify it actually
                 # processed every one of them, not just the right count.
-                try:
-                    expected_feature_ids = set(layer.allFeatureIds())
-                except Exception as exc:
+                # Gated by size: allFeatureIds() is a full provider scan that
+                # freezes the UI and the set is held for the whole export, so
+                # very large (or unknown-count) layers fall back to
+                # count-based reconciliation (manifest: "not checked").
+                feature_count = layer.featureCount()
+                if feature_count < 0 or feature_count > FEATURE_ID_SNAPSHOT_LIMIT:
                     expected_feature_ids = None
-                    self._log_message(
-                        f"Could not read feature IDs for layer '{layer.name()}' ahead of export: {exc}",
-                        "warning",
+                    why = (
+                        "its feature count is unknown"
+                        if feature_count < 0
+                        else f"it has more than {FEATURE_ID_SNAPSHOT_LIMIT:,} features"
                     )
+                    self._log_message(
+                        f"Feature-ID verification skipped for layer '{layer.name()}' because {why}; "
+                        f"count-based reconciliation still applies.",
+                        "info",
+                    )
+                else:
+                    try:
+                        expected_feature_ids = set(layer.allFeatureIds())
+                    except Exception as exc:
+                        expected_feature_ids = None
+                        self._log_message(
+                            f"Could not read feature IDs for layer '{layer.name()}' ahead of export: {exc}",
+                            "warning",
+                        )
                 layer_spec = {
                     "feature_source": QgsVectorLayerFeatureSource(layer),
                     "layer_name": layer.name(),
                     "crs_valid": layer.crs().isValid(),
-                    "feature_count": layer.featureCount(),
+                    "feature_count": feature_count,
                     "field_names": field_names,
                     "transform": transform,
                     "header_index_map": index_map,
@@ -865,6 +925,24 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         if self._active_task is not None:
             self._active_task.cancel()
             self._log_message("Cancellation requested; finishing the current feature and stopping soon.", "warning")
+
+    def shutdown(self):
+        """Cancel any running export before the dock is destroyed.
+
+        Without this, unloading/reloading the plugin mid-export orphans the
+        background task (the task manager owns it, so it keeps writing files)
+        while the rebuilt dock's _active_task is None -- letting a second
+        export start and write the same output paths concurrently."""
+        if self._active_task is None:
+            return
+        try:
+            self._active_task.taskCompleted.disconnect(self._on_export_task_completed)
+            self._active_task.taskTerminated.disconnect(self._on_export_task_terminated)
+            self._active_task.progressChanged.disconnect(self._on_export_task_progress)
+        except (TypeError, RuntimeError):
+            pass
+        self._active_task.cancel()
+        self._active_task = None
 
     def _on_export_task_progress(self, progress):
         self.progress_bar.setValue(int(progress))
