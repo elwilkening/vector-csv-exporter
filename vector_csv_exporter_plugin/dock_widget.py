@@ -1,5 +1,7 @@
+import codecs
 import csv
 import os
+import sys
 from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
@@ -34,6 +36,25 @@ from .export_utils import (
 # degrees is well below sub-millimeter precision at the equator, so this
 # trims floating-point noise from CRS reprojection without losing accuracy.
 WKT_COORDINATE_PRECISION = 8
+
+# Above this many features, the pre-export feature-ID snapshot is skipped:
+# allFeatureIds() is a full provider scan on the GUI thread and the resulting
+# set is held in memory for the whole export, so for very large layers the
+# audit falls back to count-based reconciliation (manifest: "not checked").
+FEATURE_ID_SNAPSHOT_LIMIT = 1_000_000
+
+# A codecs error handler identical to "replace" except that it counts how
+# many characters it replaced, so an export to a lossy encoding (latin-1,
+# cp1252) can report the data loss instead of silently certifying SUCCESS.
+_ENCODING_REPLACEMENTS = {"count": 0}
+
+
+def _counting_replace_handler(error):
+    _ENCODING_REPLACEMENTS["count"] += error.end - error.start
+    return ("?", error.end)
+
+
+codecs.register_error("vce_count_replace", _counting_replace_handler)
 
 # Maps QGIS field types to the type names GDAL/OGR's CSV driver recognizes in
 # a .csvt sidecar file, so a re-imported CSV regains its original field types
@@ -88,11 +109,19 @@ class ExportTask(QgsTask):
         self.escape_formulas = escape_formulas
         self.messages = []
         self.error = None
+        # featureCount() returns -1 when a provider cannot cheaply determine
+        # its count (e.g. remote WFS layers); exclude unknowns from the fixed
+        # denominator -- they are added back once the layer has actually been
+        # iterated and its true count is known.
         self.total_features = sum(
-            sum(layer_spec["feature_count"] for layer_spec in spec["layers_with_fields"]) for spec in group_specs
+            max(layer_spec["feature_count"], 0)
+            for spec in group_specs
+            for layer_spec in spec["layers_with_fields"]
         )
         self.features_written = 0
         self.features_skipped = 0
+        self.encoding_replacements = 0
+        self._last_progress = -1
         # Per-layer accounting (attempted/written/skipped) so the final
         # summary can reconcile every feature instead of just reporting a
         # single running total. Also the basis for a future export manifest.
@@ -108,15 +137,18 @@ class ExportTask(QgsTask):
         self.messages.append((text, level))
 
     def run(self):
+        _ENCODING_REPLACEMENTS["count"] = 0
         for spec in self.group_specs:
             if self.isCanceled():
                 self._log("Export cancelled by the user.", "warning")
+                self._write_manifest("CANCELLED")
                 return False
             try:
                 self._write_group(spec)
             except RuntimeError as exc:
                 if str(exc) == "cancelled":
                     self._log("Export cancelled by the user.", "warning")
+                    self._write_manifest("CANCELLED")
                     return False
                 self._remove_partial_output(spec["output_path"], reason="an export failure")
                 self.error = str(exc)
@@ -186,15 +218,40 @@ class ExportTask(QgsTask):
             self._log(f"Unable to remove partial file '{output_path}': {exc}", "warning")
             return
         self._log(f"Removed partial file '{output_path}' after {reason}.")
+        # Rows written into a file that has just been deleted no longer exist
+        # anywhere; re-book them as skipped so the manifest describes what is
+        # actually on disk instead of claiming they were exported.
+        label = f"written rows discarded ({reason})"
+        for stat in self.layer_stats:
+            if stat["output_path"] == output_path and stat["written"]:
+                stat["skip_reasons"][label] = stat["skip_reasons"].get(label, 0) + stat["written"]
+                stat["skipped"] += stat["written"]
+                self.features_skipped += stat["written"]
+                self.features_written -= stat["written"]
+                stat["written"] = 0
+
+    def _update_progress(self):
+        # Skipped features count as processed work (otherwise a heavy-skip
+        # export stalls far below 100%), and setProgress only fires when the
+        # whole percentage actually changes -- it queues a cross-thread
+        # signal, so once-per-feature emission is wasteful on large exports.
+        if self.total_features <= 0:
+            return
+        processed = self.features_written + self.features_skipped
+        progress = min(100, int(100 * processed / self.total_features))
+        if progress != self._last_progress:
+            self._last_progress = progress
+            self.setProgress(progress)
 
     def _write_group(self, spec):
         output_path = spec["output_path"]
         header = spec["header"]
         layers_with_fields = spec["layers_with_fields"]
         rows_written_for_group = 0
+        replacements_before = _ENCODING_REPLACEMENTS["count"]
 
         try:
-            with open(output_path, "w", encoding=self.encoding, errors="replace", newline="") as handle:
+            with open(output_path, "w", encoding=self.encoding, errors="vce_count_replace", newline="") as handle:
                 writer = csv.writer(handle, lineterminator="\n", delimiter=self.delimiter)
                 # Field names come from the data source and can start with a
                 # formula trigger just like a value can; escape them at the
@@ -223,15 +280,19 @@ class ExportTask(QgsTask):
                     self.layer_stats.append(layer_stat)
 
                     if not layer_spec["crs_valid"]:
-                        if attempted:
+                        # attempted may be -1 (unknown count); only book known
+                        # positive counts as skipped.
+                        if attempted > 0:
                             layer_stat["skipped"] = attempted
                             layer_stat["skip_reasons"]["invalid or undefined source CRS"] = attempted
                             self.features_skipped += attempted
+                        shown = attempted if attempted >= 0 else "an unknown number of"
                         self._log(
-                            f"Layer '{layer_name}': 0 of {attempted} feature(s) exported "
+                            f"Layer '{layer_name}': 0 of {shown} feature(s) exported "
                             f"(skipped entirely: invalid or undefined source CRS).",
                             "warning",
                         )
+                        self._update_progress()
                         continue
 
                     if attempted == 0:
@@ -263,6 +324,7 @@ class ExportTask(QgsTask):
                                 )
                                 self.features_skipped += 1
                                 skipped_ids.add(feature_id)
+                                self._update_progress()
                                 continue
 
                         row = []
@@ -290,11 +352,16 @@ class ExportTask(QgsTask):
                             except Exception:
                                 # Ignore flush errors; file will be removed on cancel/failure
                                 pass
-                        if self.total_features:
-                            progress = int(100 * self.features_written / self.total_features)
-                        else:
-                            progress = 100
-                        self.setProgress(progress)
+                        self._update_progress()
+
+                    if attempted < 0:
+                        # The provider couldn't report a count up front; now
+                        # that the layer has been fully iterated, the true
+                        # count is known -- resolve it so the summary and
+                        # manifest reconcile exactly.
+                        attempted = layer_stat["written"] + layer_stat["skipped"]
+                        layer_stat["attempted"] = attempted
+                        self.total_features += attempted
 
                     reasons = ", ".join(f"{count} {reason}" for reason, count in layer_stat["skip_reasons"].items())
                     summary = f"Layer '{layer_name}': {layer_stat['written']} of {attempted} feature(s) exported"
@@ -307,6 +374,15 @@ class ExportTask(QgsTask):
         except RuntimeError:
             raise
 
+        replaced = _ENCODING_REPLACEMENTS["count"] - replacements_before
+        if replaced:
+            self.encoding_replacements += replaced
+            self._log(
+                f"{replaced} character(s) in '{output_path}' could not be represented in "
+                f"{self.encoding} and were written as '?'. Use utf-8 to preserve them.",
+                "warning",
+            )
+
         self._log(f"Exported {output_path}")
         self._verify_output_row_count(output_path, rows_written_for_group + 1)
         self._write_csvt(output_path, spec.get("column_types"))
@@ -316,12 +392,26 @@ class ExportTask(QgsTask):
         # csv.reader so quoted embedded newlines aren't miscounted) rather
         # than trusting the in-memory write counters alone -- this catches
         # disk/encoding-layer problems the counters wouldn't see.
+        # csv.reader enforces a field size limit (default 128 KiB) that
+        # csv.writer does not, so a detailed polygon's WKT can be written
+        # fine yet raise csv.Error on the re-read; lift the limit for the
+        # verification pass and treat csv.Error as "could not verify",
+        # not a crash.
+        old_limit = None
         try:
+            try:
+                old_limit = csv.field_size_limit(sys.maxsize)
+            except OverflowError:
+                # On some platforms the limit must fit a C long.
+                old_limit = csv.field_size_limit(2**31 - 1)
             with open(output_path, "r", encoding=self.encoding, errors="replace", newline="") as handle:
                 actual_rows = sum(1 for _ in csv.reader(handle, delimiter=self.delimiter))
-        except OSError as exc:
+        except (OSError, csv.Error) as exc:
             self._log(f"Could not verify row count for '{output_path}': {exc}", "warning")
             return
+        finally:
+            if old_limit is not None:
+                csv.field_size_limit(old_limit)
 
         if actual_rows != expected_rows:
             self.verification_failures.append((output_path, expected_rows, actual_rows))
@@ -410,7 +500,7 @@ class ExportTask(QgsTask):
                     writer.writerow([
                         normalize_value(stat["layer_name"], self.escape_formulas),
                         os.path.basename(stat["output_path"]),
-                        stat["attempted"],
+                        stat["attempted"] if stat["attempted"] >= 0 else "unknown",
                         stat["written"],
                         stat["skipped"],
                         reasons,
@@ -434,6 +524,7 @@ class ExportTask(QgsTask):
                 writer.writerow(["delimiter", "Tab" if self.delimiter == "\t" else self.delimiter])
                 writer.writerow(["encoding", self.encoding])
                 writer.writerow(["formula_escaping", "on" if self.escape_formulas else "off"])
+                writer.writerow(["characters_replaced_by_encoding", self.encoding_replacements])
         except OSError as exc:
             self._log(f"Could not write export manifest '{self.manifest_path}': {exc}", "warning")
             return
@@ -856,22 +947,41 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         return True
 
     def _build_column_types(self, header, layers_with_fields, per_layer_index_maps):
-        # Determine a CSVT field type for each real attribute column by
-        # looking up the QgsField type from whichever layer's field first
-        # established that canonical header column -- same precedence
-        # build_group_header() already uses for the column name itself.
+        # Determine a CSVT field type for each real attribute column. Layers
+        # are grouped by field NAME only, so two layers can share a column
+        # while disagreeing on its type -- collect the type from EVERY
+        # contributing layer and widen on disagreement, otherwise the .csvt
+        # would coerce one layer's values to garbage on re-import.
         column_types = []
         for column in header[:-2]:
             column_lower = column.lower()
-            field_type = "String"
+            seen_types = []
             for (layer, _field_names), index_map in zip(layers_with_fields, per_layer_index_maps):
                 true_index = index_map.get(column_lower)
                 if true_index is not None:
-                    field_type = _csvt_type_for_field(layer.fields().at(true_index))
-                    break
-            column_types.append(field_type)
+                    seen_types.append(_csvt_type_for_field(layer.fields().at(true_index)))
+            column_types.append(self._widen_csvt_types(column, seen_types))
         column_types.extend(["String", "String"])  # SOURCE_LAYER, WKT
         return column_types
+
+    def _widen_csvt_types(self, column, seen_types):
+        if not seen_types:
+            return "String"
+        unique = set(seen_types)
+        if len(unique) == 1:
+            return seen_types[0]
+        if unique <= {"Integer", "Integer64"}:
+            widened = "Integer64"
+        elif unique <= {"Integer", "Integer64", "Real"}:
+            widened = "Real"
+        else:
+            widened = "String"
+        self._log_message(
+            f"Column '{column}' has different field types across grouped layers "
+            f"({', '.join(sorted(unique))}); declaring it {widened} in the .csvt sidecar.",
+            "warning",
+        )
+        return widened
 
     def _sanitize_prefix(self, prefix):
         return sanitize_prefix(prefix)
