@@ -65,6 +65,32 @@ def test_geometry_named_field_is_renamed_not_dropped():
     assert maps[0][renamed.lower()] == 1
 
 
+def test_reserved_rename_does_not_shadow_real_field_of_target_name():
+    # Regression: renaming a reserved 'geometry' field used to pick the
+    # candidate without checking the group's own later fields, so a real
+    # field named 'geometry_ATTR' was aliased onto the renamed column and
+    # its data silently dropped (index resolution matched geometry first).
+    layers = [("layer", [(0, "geometry"), (1, "geometry_ATTR"), (2, "id")])]
+    header, maps, canon = build_group_header(layers)
+
+    layer_map = canon[0]
+    renamed = layer_map["geometry"]
+    assert renamed.lower() != "geometry"
+    # the rename must not steal the real field's name
+    assert renamed.lower() != "geometry_attr"
+
+    data_columns = header[:-2]
+    assert len(data_columns) == 3
+    assert "geometry_ATTR" in data_columns
+    assert renamed in data_columns
+
+    # each column must resolve to its own attribute index
+    index_map = maps[0]
+    assert index_map[renamed.lower()] == 0
+    assert index_map["geometry_attr"] == 1
+    assert index_map["id"] == 2
+
+
 def test_data_header_signature_ignores_reserved():
     sig1 = data_header_signature(["Name", "WKT"])
     sig2 = data_header_signature(["Name"])  # WKT is reserved and should be ignored in signature

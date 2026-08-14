@@ -2,6 +2,7 @@ import codecs
 import csv
 import os
 import sys
+import threading
 from datetime import datetime
 
 from qgis.PyQt import QtCore, QtWidgets, uic
@@ -46,12 +47,24 @@ FEATURE_ID_SNAPSHOT_LIMIT = 1_000_000
 # A codecs error handler identical to "replace" except that it counts how
 # many characters it replaced, so an export to a lossy encoding (latin-1,
 # cp1252) can report the data loss instead of silently certifying SUCCESS.
-_ENCODING_REPLACEMENTS = {"count": 0}
+# Thread-local because two ExportTasks can be alive at once (QgsTask.cancel()
+# is asynchronous, so an orphaned task from a plugin reload may still be
+# writing while a new export starts); each task runs on its own thread, so a
+# per-thread counter keeps their tallies from corrupting each other.
+_ENCODING_REPLACEMENTS = threading.local()
+
+
+def _encoding_replacement_count():
+    return getattr(_ENCODING_REPLACEMENTS, "count", 0)
 
 
 def _counting_replace_handler(error):
-    _ENCODING_REPLACEMENTS["count"] += error.end - error.start
-    return ("?", error.end)
+    # Charmap codecs coalesce a run of unencodable characters into ONE
+    # UnicodeEncodeError spanning the run, so 'replace' semantics require one
+    # '?' per character, not one per error.
+    span = error.end - error.start
+    _ENCODING_REPLACEMENTS.count = _encoding_replacement_count() + span
+    return ("?" * span, error.end)
 
 
 codecs.register_error("vce_count_replace", _counting_replace_handler)
@@ -160,6 +173,15 @@ class ExportTask(QgsTask):
             for spec in group_specs
             for layer_spec in spec["layers_with_fields"]
         )
+        # While any unknown-count layer is still unresolved the denominator is
+        # incomplete, so the progress bar must not claim 100% (and must never
+        # move backwards when the true count is finally added).
+        self._unresolved_unknown_counts = sum(
+            1
+            for spec in group_specs
+            for layer_spec in spec["layers_with_fields"]
+            if layer_spec["feature_count"] < 0
+        )
         self.features_written = 0
         self.features_skipped = 0
         self.encoding_replacements = 0
@@ -169,6 +191,11 @@ class ExportTask(QgsTask):
         # single running total. Also the basis for a future export manifest.
         self.layer_stats = []
         self.verification_failures = []
+        # Layers whose provider delivered fewer features than it reported at
+        # export start, where the feature-ID snapshot was skipped (unknown
+        # count or above FEATURE_ID_SNAPSHOT_LIMIT) -- without this, silently
+        # dropped rows in very large layers would still certify SUCCESS.
+        self.count_verification_failures = []
         # Stronger than count-based reconciliation: records layers where the
         # set of feature IDs actually processed doesn't match the layer's
         # feature IDs at export start, catching cases where counts could
@@ -179,7 +206,7 @@ class ExportTask(QgsTask):
         self.messages.append((text, level))
 
     def run(self):
-        _ENCODING_REPLACEMENTS["count"] = 0
+        _ENCODING_REPLACEMENTS.count = 0
         for spec in self.group_specs:
             if self.isCanceled():
                 self._log("Export cancelled by the user.", "warning")
@@ -224,9 +251,11 @@ class ExportTask(QgsTask):
             status_parts.append("ROW_COUNT_MISMATCH")
         if self.id_verification_failures:
             status_parts.append("FEATURE_ID_MISMATCH")
+        if self.count_verification_failures:
+            status_parts.append("COUNT_MISMATCH")
         self._write_manifest("+".join(status_parts) or "SUCCESS")
 
-        if self.verification_failures or self.id_verification_failures:
+        if self.verification_failures or self.id_verification_failures or self.count_verification_failures:
             error_parts = []
             if self.verification_failures:
                 error_parts.append(
@@ -239,6 +268,14 @@ class ExportTask(QgsTask):
                     + ", ".join(
                         f"'{name}' ({missing} feature(s) never processed)"
                         for name, missing in self.id_verification_failures
+                    )
+                )
+            if self.count_verification_failures:
+                error_parts.append(
+                    "feature count reconciliation failed for "
+                    + ", ".join(
+                        f"'{name}' ({attempted - processed} feature(s) never delivered)"
+                        for name, attempted, processed in self.count_verification_failures
                     )
                 )
             self.error = "; ".join(error_parts) + "."
@@ -281,6 +318,13 @@ class ExportTask(QgsTask):
             return
         processed = self.features_written + self.features_skipped
         progress = min(100, int(100 * processed / self.total_features))
+        # An unresolved unknown-count layer means the denominator is missing
+        # at least one layer's features: claiming 100% now would pin the bar
+        # early and make it jump backwards once the true count lands. Cap
+        # below 100 until every count is known, and never move backwards.
+        if self._unresolved_unknown_counts:
+            progress = min(progress, 99)
+        progress = max(progress, self._last_progress)
         if progress != self._last_progress:
             self._last_progress = progress
             self.setProgress(progress)
@@ -290,7 +334,7 @@ class ExportTask(QgsTask):
         header = spec["header"]
         layers_with_fields = spec["layers_with_fields"]
         rows_written_for_group = 0
-        replacements_before = _ENCODING_REPLACEMENTS["count"]
+        replacements_before = _encoding_replacement_count()
 
         try:
             with open(output_path, "w", encoding=self.encoding, errors="vce_count_replace", newline="") as handle:
@@ -302,7 +346,6 @@ class ExportTask(QgsTask):
 
                 for layer_spec in layers_with_fields:
                     if self.isCanceled():
-                        self._remove_partial_output(output_path)
                         raise RuntimeError("cancelled")
 
                     layer_name = layer_spec["layer_name"]
@@ -324,6 +367,11 @@ class ExportTask(QgsTask):
                     if not layer_spec["crs_valid"]:
                         # attempted may be -1 (unknown count); only book known
                         # positive counts as skipped.
+                        if attempted < 0:
+                            # This layer's count will never be resolved (it is
+                            # skipped without iterating), so stop holding the
+                            # progress bar below 100% on its account.
+                            self._unresolved_unknown_counts -= 1
                         if attempted > 0:
                             layer_stat["skipped"] = attempted
                             layer_stat["skip_reasons"]["invalid or undefined source CRS"] = attempted
@@ -349,7 +397,6 @@ class ExportTask(QgsTask):
 
                     for feature in layer_spec["feature_source"].getFeatures():
                         if self.isCanceled():
-                            self._remove_partial_output(output_path)
                             raise RuntimeError("cancelled")
 
                         feature_id = feature.id()
@@ -404,6 +451,30 @@ class ExportTask(QgsTask):
                         attempted = layer_stat["written"] + layer_stat["skipped"]
                         layer_stat["attempted"] = attempted
                         self.total_features += attempted
+                        self._unresolved_unknown_counts -= 1
+                        self._update_progress()
+                    elif layer_spec.get("expected_feature_ids") is None:
+                        # The feature-ID snapshot was skipped (layer above
+                        # FEATURE_ID_SNAPSHOT_LIMIT, or the snapshot failed),
+                        # so count reconciliation is the only defense against
+                        # a provider iterator silently dropping features --
+                        # a shortfall must fail the export, not just log info.
+                        processed_count = layer_stat["written"] + layer_stat["skipped"]
+                        if processed_count < attempted:
+                            self.count_verification_failures.append((layer_name, attempted, processed_count))
+                            self._log(
+                                f"Layer '{layer_name}': only {processed_count} of {attempted} feature(s) were "
+                                f"delivered by the provider during export -- {attempted - processed_count} "
+                                f"feature(s) are unaccounted for. The export cannot be certified complete.",
+                                "error",
+                            )
+                        elif processed_count > attempted:
+                            self._log(
+                                f"Layer '{layer_name}': {processed_count} feature(s) were processed but the "
+                                f"layer reported {attempted} at export start -- the layer may have been "
+                                f"edited while the export was running.",
+                                "warning",
+                            )
 
                     reasons = ", ".join(f"{count} {reason}" for reason, count in layer_stat["skip_reasons"].items())
                     summary = f"Layer '{layer_name}': {layer_stat['written']} of {attempted} feature(s) exported"
@@ -413,17 +484,28 @@ class ExportTask(QgsTask):
                     self._log(summary, "warning" if layer_stat["skipped"] else "info")
 
                     self._verify_feature_ids(layer_spec, layer_stat, written_ids, skipped_ids)
-        except RuntimeError:
+        except RuntimeError as exc:
+            # Deleting the partial file must wait until the `with` block has
+            # closed the handle: on Windows, os.remove of a still-open file
+            # fails with PermissionError, silently leaving the partial CSV on
+            # disk. (Write failures are cleaned up by run(), likewise after
+            # the handle is closed.)
+            if str(exc) == "cancelled":
+                self._remove_partial_output(output_path)
             raise
-
-        replaced = _ENCODING_REPLACEMENTS["count"] - replacements_before
-        if replaced:
-            self.encoding_replacements += replaced
-            self._log(
-                f"{replaced} character(s) in '{output_path}' could not be represented in "
-                f"{self.encoding} and were written as '?'. Use utf-8 to preserve them.",
-                "warning",
-            )
+        finally:
+            # Booked in a finally so a group interrupted by cancellation or a
+            # write error still counts the replacements it already made --
+            # otherwise the CANCELLED/ERROR manifest would report 0 for a
+            # file that contains '?' substitutions.
+            replaced = _encoding_replacement_count() - replacements_before
+            if replaced:
+                self.encoding_replacements += replaced
+                self._log(
+                    f"{replaced} character(s) in '{output_path}' could not be represented in "
+                    f"{self.encoding} and were written as '?'. Use utf-8 to preserve them.",
+                    "warning",
+                )
 
         self._log(f"Exported {output_path}")
         self._verify_output_row_count(output_path, rows_written_for_group + 1)
@@ -590,16 +672,24 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         # panel, or _active_layer_id desyncs from what the user is viewing
         # and their field edits get saved against the wrong layer.
         self.layer_list_widget.currentItemChanged.connect(self._on_current_layer_changed)
+        # currentItemChanged does not fire when the already-current row is
+        # clicked again, so without this a re-click cannot refresh the panel
+        # after the layer's schema changed mid-session -- and the stale list
+        # would then be snapshotted as the user's explicit field selection.
+        self.layer_list_widget.itemClicked.connect(self._show_selected_layer_fields)
         self.layer_list_widget.itemChanged.connect(self._sync_select_all_checkbox)
         self.field_list_widget.itemChanged.connect(self._on_field_item_changed)
         self.progress_bar.setVisible(False)
         self.cancel_button.setVisible(False)
         self._active_task = None
         self._settings = QtCore.QSettings("QGIS", "VectorCsvExporter")
-        # Maps layer id -> the field names the user explicitly chose. A layer
-        # ABSENT from this dict means "all fields", resolved freshly at
-        # display and export time -- so fields added to a layer mid-session
-        # are included unless the user has customized that layer's list.
+        # Maps layer id -> the attribute INDICES the user explicitly chose.
+        # Indices, not names: a layer can carry duplicate field names, and a
+        # name set cannot represent checking one duplicate but not the other.
+        # A layer ABSENT from this dict means "all fields", resolved freshly
+        # at display and export time -- so fields added to a layer
+        # mid-session are included unless the user has customized that
+        # layer's list.
         self._layer_field_selection = {}
         self._active_layer_id = None
         self._populating_fields = False
@@ -705,17 +795,19 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             return
         self._active_layer_id = layer.id()
         field_names = [field.name().strip() for field in layer.fields()]
-        checked_fields = self._layer_field_selection.get(layer.id(), set(field_names))
+        # None means "all fields" (the layer was never customized).
+        selected_indices = self._layer_field_selection.get(layer.id())
         # Guard against the itemChanged signals the setCheckState calls below
         # emit: without it, a half-built list would be saved as the layer's
         # explicit field selection mid-rebuild.
         self._populating_fields = True
         try:
-            for field_name in field_names:
+            for field_index, field_name in enumerate(field_names):
                 field_item = QtWidgets.QListWidgetItem(field_name)
-                field_item.setData(QtCore.Qt.UserRole, field_name)
+                field_item.setData(QtCore.Qt.UserRole, field_index)
                 field_item.setFlags(field_item.flags() | QtCore.Qt.ItemIsUserCheckable)
-                field_item.setCheckState(QtCore.Qt.Checked if field_name in checked_fields else QtCore.Qt.Unchecked)
+                checked = selected_indices is None or field_index in selected_indices
+                field_item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
                 self.field_list_widget.addItem(field_item)
         finally:
             self._populating_fields = False
@@ -727,12 +819,12 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
         layer = QgsProject.instance().mapLayer(layer_id)
         if not isinstance(layer, QgsVectorLayer):
             return
-        selected_fields = set()
+        selected_indices = set()
         for index in range(self.field_list_widget.count()):
             item = self.field_list_widget.item(index)
             if item.checkState() == QtCore.Qt.Checked:
-                selected_fields.add(item.text())
-        self._layer_field_selection[layer.id()] = selected_fields
+                selected_indices.add(item.data(QtCore.Qt.UserRole))
+        self._layer_field_selection[layer.id()] = selected_indices
 
     def _update_crs_selector_state(self, checked):
         self._crs_selector.setEnabled(not checked)
@@ -788,9 +880,15 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
 
         for layer in selected_layers:
             all_field_names = [field.name().strip() for field in layer.fields()]
-            selected_fields = self._layer_field_selection.get(layer.id(), set(all_field_names))
+            # None means "all fields"; otherwise a set of attribute indices,
+            # so duplicate-named fields keep independent selection state.
+            selected_indices = self._layer_field_selection.get(layer.id())
             # Preserve true original indices by building (orig_index, name) pairs
-            field_pairs = [(idx, name) for idx, name in enumerate(all_field_names) if name in selected_fields]
+            field_pairs = [
+                (idx, name)
+                for idx, name in enumerate(all_field_names)
+                if selected_indices is None or idx in selected_indices
+            ]
             if not field_pairs and all_field_names:
                 self._log_message(
                     f"Layer '{layer.name()}' has no selected fields; exporting geometry-only CSV.",

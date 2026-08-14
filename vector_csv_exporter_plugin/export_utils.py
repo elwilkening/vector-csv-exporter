@@ -61,9 +61,12 @@ def sanitize_prefix(prefix):
     # named ".csv"); strip it here so the rest of the pipeline never sees it.
     if sanitized.lower().endswith(".csv"):
         sanitized = sanitized[:-4]
-    stem = sanitized.split(".")[0].lower()
-    if stem in _WINDOWS_RESERVED_NAMES:
-        sanitized = f"{sanitized}_"
+    # Windows resolves device names from the segment before the FIRST dot,
+    # so the defusing underscore must go on the stem itself: appending it to
+    # the whole prefix would leave "nul.report_" still resolving to NUL.
+    stem, dot, rest = sanitized.partition(".")
+    if stem.lower() in _WINDOWS_RESERVED_NAMES:
+        sanitized = f"{stem}_{dot}{rest}"
     return sanitized or "export"
 
 
@@ -111,6 +114,16 @@ def dedupe_field_names(field_names):
     new_field_pairs = []
     renames = []  # list of tuples (orig_lower, new_name, true_index)
 
+    # Rename candidates must not collide with any of the layer's own field
+    # names, including ones not yet processed -- otherwise renaming the
+    # second 'value' to 'value_ATTR' would collide with a real later field
+    # of that name.
+    all_names_lower = set()
+    for item in field_names:
+        name = item[1] if isinstance(item, tuple) and len(item) >= 2 else item
+        if name and name.strip():
+            all_names_lower.add(name.strip().lower())
+
     for item in field_names:
         # field_names may be a list of names or (index, name) pairs; normalize
         if isinstance(item, tuple) and len(item) >= 2:
@@ -128,7 +141,7 @@ def dedupe_field_names(field_names):
         if n_lower in used_lower:
             # Need to pick a unique candidate that doesn't collide with
             # already used names or reserved names.
-            candidate = _uniquify_name(normalized, used_lower.union(RESERVED_NAMES))
+            candidate = _uniquify_name(normalized, used_lower | RESERVED_NAMES | all_names_lower)
             new_field_pairs.append((orig_index, candidate))
             renames.append((n_lower, candidate, orig_index))
             used_lower.add(candidate.lower())
@@ -175,10 +188,22 @@ def build_group_header(layers_with_fields):
     a list (parallel to layers_with_fields) of dicts mapping header_name.lower()
     -> attribute_index (or None).
     """
+    layers_with_fields = list(layers_with_fields)
     header = []
     used_map = {}  # lower -> header_name (canonical)
     reserved = RESERVED_NAMES
     per_layer_maps = []
+
+    # Rename candidates must not collide with ANY real field name in the
+    # group, including ones not yet processed: otherwise renaming a reserved
+    # field to e.g. "geometry_ATTR" would alias a later real field of that
+    # name onto the same column and silently drop its data.
+    all_field_names_lower = set()
+    for _layer, field_names in layers_with_fields:
+        for entry in field_names:
+            name = entry[1] if isinstance(entry, tuple) and len(entry) >= 2 else entry
+            if name and name.strip():
+                all_field_names_lower.add(name.strip().lower())
 
     # First pass: build canonical header names, renaming conflicting real fields
     for layer, field_names in layers_with_fields:
@@ -201,7 +226,10 @@ def build_group_header(layers_with_fields):
             if n_lower in reserved:
                 # need to pick a unique renamed candidate; register both the
                 # canonical candidate and the original lowercased reserved name
-                candidate = _uniquify_name(normalized, set(used_map.keys()).union(reserved))
+                candidate = _uniquify_name(
+                    normalized,
+                    set(used_map.keys()) | reserved | all_field_names_lower,
+                )
                 used_map[candidate.lower()] = candidate
                 used_map[n_lower] = candidate
                 header.append(candidate)

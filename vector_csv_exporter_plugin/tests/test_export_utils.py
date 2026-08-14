@@ -73,6 +73,16 @@ def test_sanitize_prefix_defuses_windows_reserved_device_names():
     assert sanitize_prefix("console") == "console"  # not reserved, unchanged
 
 
+def test_sanitize_prefix_defuses_dotted_reserved_device_names():
+    # Windows resolves device names from the segment before the FIRST dot,
+    # so the defusing underscore must land on the stem itself: appending it
+    # to the whole prefix ("nul.report_") would still write to NUL.
+    assert sanitize_prefix("nul.report") == "nul_.report"
+    assert sanitize_prefix("CON.backup") == "CON_.backup"
+    # .csv is stripped first, then the remaining stem is defused
+    assert sanitize_prefix("nul.data.csv") == "nul_.data"
+
+
 def test_build_output_name_uses_group_suffix_when_needed():
     assert build_output_name("export", 2, 1) == "export_group1.csv"
     assert build_output_name("export.csv", 1, 1) == "export.csv"
@@ -113,3 +123,16 @@ def test_dedupe_field_names_three_way_duplicate():
     assert len(set(n.lower() for n in names)) == 3
     # renames should record two rename operations (for the 2nd and 3rd)
     assert len(renames) >= 2
+
+
+def test_dedupe_rename_does_not_shadow_real_later_field():
+    # Regression: renaming the duplicate 'value' used to pick 'value_ATTR'
+    # without checking the layer's own later fields, so a real field named
+    # 'value_ATTR' ended up sharing its name with the renamed duplicate.
+    fields = ["value", "value", "value_ATTR"]
+    new_fields, _renames = dedupe_field_names(fields)
+    names = [n for (_i, n) in new_fields]
+    assert len(set(n.lower() for n in names)) == 3
+    # the real value_ATTR keeps its own name; the duplicate got a fresh one
+    assert names[2] == "value_ATTR"
+    assert names[1].lower() != "value_attr"
