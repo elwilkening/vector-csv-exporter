@@ -36,7 +36,7 @@ Exports selected QGIS vector layers' attributes and geometries to CSV files, rep
 
 ## Author
 
-Eric Wilkening with OpenAI (<elwilkening@outlook.com>)
+Eric Wilkening
 
 ## License
 
