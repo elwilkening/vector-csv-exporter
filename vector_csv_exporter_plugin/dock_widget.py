@@ -33,10 +33,12 @@ from .export_utils import (
     dedupe_field_names,
 )
 
-# Decimal degrees of precision for exported WKT coordinates. 8 decimal
-# degrees is well below sub-millimeter precision at the equator, so this
-# trims floating-point noise from CRS reprojection without losing accuracy.
-WKT_COORDINATE_PRECISION = 8
+# Excel refuses to open cells longer than 32,767 characters. Start with three
+# decimal places, then simplify oversized geometries until their WKT fits.
+EXCEL_CELL_CHARACTER_LIMIT = 32767
+WKT_COORDINATE_PRECISION = 3
+WKT_SIMPLIFICATION_INITIAL_TOLERANCE = 0.001
+WKT_SIMPLIFICATION_MAX_TOLERANCE = 1e12
 
 # Above this many features, the pre-export feature-ID snapshot is skipped:
 # allFeatureIds() is a full provider scan on the GUI thread and the resulting
@@ -152,6 +154,23 @@ def prepare_attribute_value(value, escape_formulas=True):
     elif isinstance(value, QByteArray):
         value = bytes(value)
     return normalize_value(value, escape_formulas)
+
+
+def geometry_wkt_for_csv(geometry):
+    """Return WKT with enough detail to fit within Excel's cell limit."""
+    wkt = geometry.asWkt(WKT_COORDINATE_PRECISION)
+    if len(wkt) <= EXCEL_CELL_CHARACTER_LIMIT:
+        return wkt
+
+    tolerance = WKT_SIMPLIFICATION_INITIAL_TOLERANCE
+    while tolerance <= WKT_SIMPLIFICATION_MAX_TOLERANCE:
+        simplified = geometry.simplify(tolerance)
+        wkt = simplified.asWkt(WKT_COORDINATE_PRECISION)
+        if len(wkt) <= EXCEL_CELL_CHARACTER_LIMIT:
+            return wkt
+        tolerance *= 10
+
+    return wkt
 
 
 class ExportTask(QgsTask):
@@ -427,7 +446,7 @@ class ExportTask(QgsTask):
                         # The layer name comes from the project file, not the
                         # exporting user -- escape it like any other value.
                         row.append(normalize_value(layer_name, self.escape_formulas))
-                        row.append(geometry.asWkt(WKT_COORDINATE_PRECISION))
+                        row.append(geometry_wkt_for_csv(geometry))
                         writer.writerow(row)
                         rows_written_for_group += 1
                         self.features_written += 1
