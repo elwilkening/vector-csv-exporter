@@ -2,6 +2,7 @@ import codecs
 import csv
 import os
 import sys
+import tempfile
 import threading
 from datetime import datetime
 
@@ -45,6 +46,7 @@ WKT_SIMPLIFICATION_MAX_TOLERANCE = 1e12
 # set is held in memory for the whole export, so for very large layers the
 # audit falls back to count-based reconciliation (manifest: "not checked").
 FEATURE_ID_SNAPSHOT_LIMIT = 1_000_000
+CSVT_DIRECTORY_NAME = "csvt"
 
 # A codecs error handler identical to "replace" except that it counts how
 # many characters it replaced, so an export to a lossy encoding (latin-1,
@@ -220,6 +222,7 @@ class ExportTask(QgsTask):
         # feature IDs at export start, catching cases where counts could
         # coincidentally match despite the wrong features being processed.
         self.id_verification_failures = []
+        self.artifact_failures = []
 
     def _log(self, text, level="info"):
         self.messages.append((text, level))
@@ -232,21 +235,32 @@ class ExportTask(QgsTask):
                 self._write_manifest("CANCELLED")
                 return False
             try:
+                os.makedirs(os.path.dirname(self._csvt_path(spec["output_path"])), exist_ok=True)
+                spec["temporary_output_path"] = self._make_temporary_path(spec["output_path"])
+                spec["temporary_csvt_path"] = self._make_temporary_path(self._csvt_path(spec["output_path"]))
                 self._write_group(spec)
+                self._commit_group(spec)
             except RuntimeError as exc:
                 if str(exc) == "cancelled":
                     self._log("Export cancelled by the user.", "warning")
+                    self._remove_temporary_outputs(spec)
                     self._write_manifest("CANCELLED")
                     return False
-                self._remove_partial_output(spec["output_path"], reason="an export failure")
+                self._remove_temporary_outputs(spec)
                 self.error = str(exc)
                 self._log(f"Export failed: {exc}", "error")
                 self._write_manifest("ERROR")
                 return False
             except OSError as exc:
-                self._remove_partial_output(spec["output_path"], reason="a write failure")
+                self._remove_temporary_outputs(spec)
                 self.error = str(exc)
                 self._log(f"Failed to write file '{spec['output_path']}': {exc}", "error")
+                self._write_manifest("ERROR")
+                return False
+            except Exception as exc:
+                self._remove_temporary_outputs(spec)
+                self.error = str(exc)
+                self._log(f"Unexpected export failure for '{spec['output_path']}': {exc}", "error")
                 self._write_manifest("ERROR")
                 return False
 
@@ -272,9 +286,20 @@ class ExportTask(QgsTask):
             status_parts.append("FEATURE_ID_MISMATCH")
         if self.count_verification_failures:
             status_parts.append("COUNT_MISMATCH")
-        self._write_manifest("+".join(status_parts) or "SUCCESS")
+        if self.encoding_replacements:
+            status_parts.append("ENCODING_REPLACEMENTS")
+        if self.artifact_failures:
+            status_parts.append("ARTIFACT_FAILURE")
+        export_status = "+".join(status_parts) or "SUCCESS"
+        self._write_manifest(export_status)
 
-        if self.verification_failures or self.id_verification_failures or self.count_verification_failures:
+        if (
+            self.verification_failures
+            or self.id_verification_failures
+            or self.count_verification_failures
+            or self.encoding_replacements
+            or self.artifact_failures
+        ):
             error_parts = []
             if self.verification_failures:
                 error_parts.append(
@@ -297,6 +322,12 @@ class ExportTask(QgsTask):
                         for name, attempted, processed in self.count_verification_failures
                     )
                 )
+            if self.encoding_replacements:
+                error_parts.append(
+                    f"{self.encoding_replacements} character(s) could not be represented in {self.encoding}"
+                )
+            if self.artifact_failures:
+                error_parts.append("required export artifacts could not be created or verified")
             self.error = "; ".join(error_parts) + "."
             self._log(
                 "Export finished writing, but verification found problems -- see errors above.",
@@ -306,6 +337,42 @@ class ExportTask(QgsTask):
 
         self._log("Export completed successfully.")
         return True
+
+    @staticmethod
+    def _make_temporary_path(final_path):
+        directory = os.path.dirname(final_path) or "."
+        suffix = ".tmp" + os.path.splitext(final_path)[1]
+        descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(final_path)}.",
+            suffix=suffix,
+            dir=directory,
+        )
+        os.close(descriptor)
+        return temporary_path
+
+    @staticmethod
+    def _csvt_path(output_path):
+        output_dir = os.path.dirname(output_path)
+        csvt_dir = os.path.join(output_dir, CSVT_DIRECTORY_NAME)
+        return os.path.join(csvt_dir, os.path.splitext(os.path.basename(output_path))[0] + ".csvt")
+
+    def _remove_temporary_outputs(self, spec):
+        for path in (spec.get("temporary_output_path"), spec.get("temporary_csvt_path")):
+            if not path:
+                continue
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self._log(f"Unable to remove temporary file '{path}': {exc}", "warning")
+
+    def _commit_group(self, spec):
+        csvt_path = self._csvt_path(spec["output_path"])
+        os.makedirs(os.path.dirname(csvt_path), exist_ok=True)
+        os.replace(spec["temporary_output_path"], spec["output_path"])
+        if spec.get("column_types"):
+            os.replace(spec["temporary_csvt_path"], csvt_path)
 
     def _remove_partial_output(self, output_path, reason="cancellation"):
         try:
@@ -350,13 +417,17 @@ class ExportTask(QgsTask):
 
     def _write_group(self, spec):
         output_path = spec["output_path"]
+        temporary_output_path = spec.get("temporary_output_path", output_path)
         header = spec["header"]
         layers_with_fields = spec["layers_with_fields"]
         rows_written_for_group = 0
         replacements_before = _encoding_replacement_count()
+        verification_failures_before = len(self.verification_failures)
+        id_failures_before = len(self.id_verification_failures)
+        count_failures_before = len(self.count_verification_failures)
 
         try:
-            with open(output_path, "w", encoding=self.encoding, errors="vce_count_replace", newline="") as handle:
+            with open(temporary_output_path, "w", encoding=self.encoding, errors="vce_count_replace", newline="") as handle:
                 writer = csv.writer(handle, lineterminator="\n", delimiter=self.delimiter)
                 # Field names come from the data source and can start with a
                 # formula trigger just like a value can; escape them at the
@@ -510,7 +581,7 @@ class ExportTask(QgsTask):
             # disk. (Write failures are cleaned up by run(), likewise after
             # the handle is closed.)
             if str(exc) == "cancelled":
-                self._remove_partial_output(output_path)
+                self._remove_temporary_outputs({"temporary_output_path": temporary_output_path})
             raise
         finally:
             # Booked in a finally so a group interrupted by cancellation or a
@@ -526,9 +597,18 @@ class ExportTask(QgsTask):
                     "warning",
                 )
 
-        self._log(f"Exported {output_path}")
-        self._verify_output_row_count(output_path, rows_written_for_group + 1)
-        self._write_csvt(output_path, spec.get("column_types"))
+        self._log(f"Staged {output_path}")
+        self._verify_output_row_count(temporary_output_path, rows_written_for_group + 1)
+        if not self._write_csvt(spec.get("temporary_csvt_path"), spec.get("column_types")):
+            raise RuntimeError("required .csvt sidecar could not be written")
+        if len(self.verification_failures) > verification_failures_before:
+            raise RuntimeError("CSV row-count verification failed")
+        if len(self.id_verification_failures) > id_failures_before:
+            raise RuntimeError("feature ID verification failed")
+        if len(self.count_verification_failures) > count_failures_before:
+            raise RuntimeError("feature count verification failed")
+        if _encoding_replacement_count() > replacements_before:
+            raise RuntimeError("output encoding replaced one or more characters")
 
     def _verify_output_row_count(self, output_path, expected_rows):
         # Re-read the file we just wrote and count its actual rows (via
@@ -550,7 +630,8 @@ class ExportTask(QgsTask):
             with open(output_path, "r", encoding=self.encoding, errors="replace", newline="") as handle:
                 actual_rows = sum(1 for _ in csv.reader(handle, delimiter=self.delimiter))
         except (OSError, csv.Error) as exc:
-            self._log(f"Could not verify row count for '{output_path}': {exc}", "warning")
+            self.verification_failures.append((output_path, expected_rows, None))
+            self._log(f"Could not verify row count for '{output_path}': {exc}", "error")
             return
         finally:
             if old_limit is not None:
@@ -566,23 +647,22 @@ class ExportTask(QgsTask):
         else:
             self._log(f"Verified '{output_path}': row count matches ({actual_rows} rows).")
 
-    def _write_csvt(self, output_path, column_types):
-        # A .csvt sidecar (GDAL/OGR's CSV-driver convention: same basename,
-        # always comma-separated regardless of the main file's delimiter)
-        # lets a re-imported CSV regain its original field types instead of
-        # every column becoming plain text. Best-effort: failure here
-        # shouldn't fail an otherwise-successful export.
+    def _write_csvt(self, csvt_path, column_types):
+        # Keep CSVT metadata separate from the user-facing CSV files while
+        # retaining the CSV basename so the relationship remains clear.
         if not column_types:
-            return
-        csvt_path = os.path.splitext(output_path)[0] + ".csvt"
+            return True
         try:
+            os.makedirs(os.path.dirname(csvt_path), exist_ok=True)
             with open(csvt_path, "w", encoding="utf-8", newline="") as handle:
                 writer = csv.writer(handle, lineterminator="\n", quoting=csv.QUOTE_ALL)
                 writer.writerow(column_types)
         except OSError as exc:
             self._log(f"Could not write field-type sidecar '{csvt_path}': {exc}", "warning")
-            return
+            self.artifact_failures.append(csvt_path)
+            return False
         self._log(f"Wrote field-type sidecar '{csvt_path}'.")
+        return True
 
     def _verify_feature_ids(self, layer_spec, layer_stat, written_ids, skipped_ids):
         # Counts can coincidentally match even if the wrong features were
@@ -623,12 +703,15 @@ class ExportTask(QgsTask):
         # A durable, on-disk record of exactly what was processed -- unlike
         # the status log, this survives after the dock is closed and can be
         # handed to someone else as evidence nothing was silently dropped.
+        temporary_path = None
         try:
-            with open(self.manifest_path, "w", encoding="utf-8", newline="") as handle:
+            temporary_path = self._make_temporary_path(self.manifest_path)
+            with open(temporary_path, "w", encoding="utf-8", newline="") as handle:
                 writer = csv.writer(handle, lineterminator="\n")
                 writer.writerow([
                     "source_layer",
                     "output_file",
+                    "metadata_file",
                     "features_in_layer",
                     "features_exported",
                     "features_skipped",
@@ -643,6 +726,7 @@ class ExportTask(QgsTask):
                     writer.writerow([
                         normalize_value(stat["layer_name"], self.escape_formulas),
                         os.path.basename(stat["output_path"]),
+                        os.path.join(CSVT_DIRECTORY_NAME, os.path.splitext(os.path.basename(stat["output_path"]))[0] + ".csvt"),
                         stat["attempted"] if stat["attempted"] >= 0 else "unknown",
                         stat["written"],
                         stat["skipped"],
@@ -654,6 +738,7 @@ class ExportTask(QgsTask):
                 writer.writerow([
                     "TOTAL",
                     f"{len(self.group_specs)} file(s)",
+                    "",
                     self.total_features,
                     self.features_written,
                     self.features_skipped,
@@ -668,11 +753,19 @@ class ExportTask(QgsTask):
                 writer.writerow(["encoding", self.encoding])
                 writer.writerow(["formula_escaping", "on" if self.escape_formulas else "off"])
                 writer.writerow(["characters_replaced_by_encoding", self.encoding_replacements])
+            os.replace(temporary_path, self.manifest_path)
+            temporary_path = None
         except OSError as exc:
             self._log(f"Could not write export manifest '{self.manifest_path}': {exc}", "warning")
-            return
+        finally:
+            if temporary_path:
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
 
-        self._log(f"Wrote export manifest '{self.manifest_path}'.")
+        if os.path.exists(self.manifest_path):
+            self._log(f"Wrote export manifest '{self.manifest_path}'.")
 
 
 class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
@@ -1041,7 +1134,7 @@ class VectorCsvExporterDockWidget(QtWidgets.QDockWidget):
             suffix += 1
 
         prospective_outputs = list(existing_outputs) + [manifest_path]
-        prospective_outputs += [os.path.splitext(p)[0] + ".csvt" for p in existing_outputs]
+        prospective_outputs += [ExportTask._csvt_path(p) for p in existing_outputs]
         already_existing = sorted(os.path.basename(p) for p in prospective_outputs if os.path.exists(p))
         if already_existing:
             reply = QtWidgets.QMessageBox.question(

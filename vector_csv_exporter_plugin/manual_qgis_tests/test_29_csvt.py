@@ -58,7 +58,7 @@ for text, level in task.messages:
     print(f"[{level}] {text}")
 print("task result:", result, "task.error:", task.error)
 
-csvt_path = os.path.splitext(output_path)[0] + ".csvt"
+csvt_path = os.path.join(os.path.dirname(output_path), "csvt", os.path.splitext(os.path.basename(output_path))[0] + ".csvt")
 assert os.path.exists(csvt_path), f"csvt sidecar not written: {csvt_path}"
 with open(csvt_path, newline="") as handle:
     csvt_row = next(csv.reader(handle))

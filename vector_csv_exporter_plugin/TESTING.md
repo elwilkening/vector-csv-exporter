@@ -103,10 +103,10 @@ integration tests in `manual_qgis_tests/`, using the Python interpreter QGIS shi
     write-permission error rather than failing silently or crashing.
 28. **Overwrite warning** (`manual_qgis_tests/test_28_overwrite_warning.py`): run the same export
     twice into the same directory with the same prefix -- confirm the second run shows a
-    confirmation dialog listing the files that will be overwritten (group CSV(s), `.csvt`
+    confirmation dialog listing the files that will be overwritten (group CSV(s), `csvt/`
     sidecar(s), and manifest), and that declining aborts without touching any files.
-29. **CSVT sidecar** (`manual_qgis_tests/test_29_csvt.py`): after export, confirm a `<output>.csvt`
-    file exists next to each group CSV, with one quoted type per column matching the header (e.g.
+29. **CSVT sidecar** (`manual_qgis_tests/test_29_csvt.py`): after export, confirm a `csvt/<output>.csvt`
+    file exists for each group CSV, with one quoted type per column matching the header (e.g.
     `"Integer","String","Real",...,"String","String"` -- the last two always `String` for
     `SOURCE_LAYER`/`WKT`). Re-import the CSV into QGIS via "Add Delimited Text Layer" and confirm
     numeric/date fields come back typed instead of as text.

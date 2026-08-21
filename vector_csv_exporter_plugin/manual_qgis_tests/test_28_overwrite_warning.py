@@ -58,7 +58,7 @@ try:
     dock.export_selected_layers()
 
     output_csv = os.path.join(out_dir, "overwrite_test.csv")
-    output_csvt = os.path.join(out_dir, "overwrite_test.csvt")
+    output_csvt = os.path.join(out_dir, "csvt", "overwrite_test.csvt")
     manifest_path = os.path.join(out_dir, "overwrite_test_manifest.csv")
 
     assert len(recorder_run1.calls) == 0, "first run into an empty directory should show no overwrite dialog"

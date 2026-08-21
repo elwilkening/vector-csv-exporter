@@ -12,7 +12,7 @@ Exports selected QGIS vector layers' attributes and geometries to CSV files, rep
 - Duplicate field names within a layer, and real fields that collide with the plugin's own `SOURCE_LAYER`/`WKT` columns, are automatically renamed rather than dropped.
 - Choose the output delimiter (`,`, `;`, Tab) and encoding (utf-8, latin-1, cp1252).
 - CSV-injection protection (values starting with `=`, `+`, `-`, `@` are escaped) and correct handling of NULL attribute values.
-- A `.csvt` sidecar file is written alongside each output CSV so re-importing it into QGIS (or any GDAL/OGR-based tool) restores the original field types instead of everything becoming text.
+- A `.csvt` sidecar file is written in a `csvt` subfolder so the output directory stays uncluttered; the manifest records each metadata path. Re-importing the CSV into QGIS (or any GDAL/OGR-based tool) can use the sidecar to restore the original field types instead of treating everything as text.
 - Background export with a progress bar and cancel support; partial output is cleaned up on cancellation or failure.
 - Warns before overwriting existing output files, and before exporting a layer whose CRS can't be reprojected to the target CRS.
 - After every export, a `<prefix>_manifest.csv` documents exactly what happened: per-layer feature counts (attempted/exported/skipped, with reasons), a reconciled total, and row-count and feature-ID verification against what was actually written -- durable evidence that nothing was silently dropped, even after the plugin's own log is gone.
@@ -32,7 +32,7 @@ Exports selected QGIS vector layers' attributes and geometries to CSV files, rep
 2. Check the layers to export; click a layer to choose which of its fields to include (all are included by default).
 3. Set the delimiter, encoding, and target CRS (or check "Keep original CRS").
 4. Choose an output directory and a filename prefix, then click Export.
-5. Review the status log, and the `<prefix>_manifest.csv` written alongside your output, to confirm the export was complete.
+5. Review the status log, the `<prefix>_manifest.csv`, and the `csvt` subfolder to confirm the export was complete and metadata was created.
 
 ## Author
 

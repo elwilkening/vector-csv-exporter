@@ -88,7 +88,7 @@ assert result is False, "expected the task to report failure"
 assert task.error, "expected task.error to be set"
 
 assert os.path.exists(group_a_path), "group A (which succeeded) should still exist"
-assert os.path.exists(group_a_path.replace(".csv", ".csvt")), "group A's .csvt sidecar should exist"
+assert os.path.exists(os.path.join(out_dir, "csvt", "group_a.csvt")), "group A's .csvt sidecar should exist"
 
 assert not os.path.exists(group_b_path), (
     f"group B's PARTIAL output should have been removed after the mid-write failure, "
